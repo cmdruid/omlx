@@ -17,9 +17,11 @@ Supports:
 import contextlib
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
+
+from omlx.adapter_utils import AdapterInfo
 
 logger = logging.getLogger(__name__)
 
@@ -273,6 +275,7 @@ class DiscoveredModel:
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
     thinking_default: bool | None = None  # True if model thinks by default, False if not, None if unknown
     preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
+    available_adapters: list[AdapterInfo] = field(default_factory=list)  # LoRA adapters for this base model
 
 
 def _is_unsupported_model(model_path: Path) -> bool:
@@ -646,6 +649,46 @@ def _is_adapter_dir(path: Path) -> bool:
     return (path / "adapter_config.json").exists()
 
 
+def _try_attach_adapter(
+    adapter_dir: Path,
+    models: dict[str, DiscoveredModel],
+) -> bool:
+    """Attach an adapter to its base model's available_adapters list.
+
+    Returns True if attached; False if base not found or metadata invalid.
+    """
+    from .adapter_utils import resolve_adapter_metadata, AdapterInfo
+    try:
+        md = resolve_adapter_metadata(adapter_dir)
+    except (FileNotFoundError, ValueError) as e:
+        logger.warning(f"Skipping adapter {adapter_dir.name}: {e}")
+        return False
+
+    # Try direct model_id match, then basename match (HF-style "org/name")
+    base_id = None
+    if md.base_ref in models:
+        base_id = md.base_ref
+    else:
+        basename = md.base_ref.split("/")[-1]
+        if basename in models:
+            base_id = basename
+
+    if base_id is None:
+        logger.warning(
+            f"Adapter {adapter_dir.name} references unknown base "
+            f"{md.base_ref!r} — skipping"
+        )
+        return False
+
+    info = AdapterInfo.from_metadata(adapter_dir.name, str(adapter_dir), md)
+    models[base_id].available_adapters.append(info)
+    logger.info(
+        f"Attached adapter {adapter_dir.name} to base {base_id} "
+        f"(rank={md.rank}, layers={md.num_layers})"
+    )
+    return True
+
+
 def _is_model_dir(path: Path) -> bool:
     """Check if a directory contains a valid model (has config.json)."""
     return (path / "config.json").exists() and not _is_adapter_dir(path)
@@ -772,16 +815,15 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
         raise ValueError(f"Model directory is not a directory: {model_dir}")
 
     models: dict[str, DiscoveredModel] = {}
+    adapter_dirs_pending: list[Path] = []
 
     for subdir in sorted(model_dir.iterdir()):
         if not subdir.is_dir() or subdir.name.startswith("."):
             continue
 
         if _is_adapter_dir(subdir):
-            logger.info(
-                f"Skipping LoRA adapter: {subdir.name} "
-                "(oMLX does not support LoRA/PEFT adapters)"
-            )
+            adapter_dirs_pending.append(subdir)
+            continue
         elif _is_model_dir(subdir):
             # Level 1: direct model folder
             _register_model(models, subdir, subdir.name)
@@ -800,10 +842,8 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
                 if not child.is_dir() or child.name.startswith("."):
                     continue
                 if _is_adapter_dir(child):
-                    logger.info(
-                        f"Skipping LoRA adapter: {child.name} "
-                        "(oMLX does not support LoRA/PEFT adapters)"
-                    )
+                    adapter_dirs_pending.append(child)
+                    continue
                 elif _is_model_dir(child):
                     has_children = True
                     _register_model(models, child, child.name)
@@ -819,6 +859,10 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
     #   /Models/Qwen3.5-9B-MLX-4bit/  (contains config.json and weight files)
     if not models and _is_model_dir(model_dir):
         _register_model(models, model_dir, model_dir.name)
+
+    # Second pass: attach collected adapter dirs to their base models.
+    for adapter_dir in adapter_dirs_pending:
+        _try_attach_adapter(adapter_dir, models)
 
     return models
 
