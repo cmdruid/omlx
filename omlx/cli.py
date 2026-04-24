@@ -477,6 +477,116 @@ def diagnose_menubar() -> int:
     return 0
 
 
+def adapter_list_command(args) -> int:
+    """List all discovered adapters across all discovered bases."""
+    from collections import defaultdict
+    from pathlib import Path
+
+    from .model_discovery import discover_adapters, discover_models
+
+    models_dir = Path(args.models_dir) if args.models_dir else Path.home() / ".omlx" / "models"
+    adapter_dir = models_dir.parent / "adapters"
+
+    if not models_dir.exists():
+        print(f"error: models directory not found: {models_dir}", file=sys.stderr)
+        return 1
+
+    models = discover_models(models_dir)
+    if adapter_dir.exists():
+        discover_adapters(adapter_dir, models)
+
+    # Inverse index: adapter_id -> list of (base_model_id, AdapterInfo)
+    adapter_index: dict[str, list[tuple[str, object]]] = defaultdict(list)
+    for base_id, entry in models.items():
+        for info in entry.available_adapters:
+            adapter_index[info.adapter_id].append((base_id, info))
+
+    if not adapter_index:
+        print("No adapters discovered.")
+        if not adapter_dir.exists():
+            print(f"  (adapter root does not exist: {adapter_dir})")
+        return 0
+
+    # Format table
+    rows = []
+    for adapter_id, attachments in sorted(adapter_index.items()):
+        first_info = attachments[0][1]
+        base_list = ", ".join(sorted(base for base, _ in attachments))
+        rows.append({
+            "adapter": adapter_id,
+            "rank": str(first_info.rank),
+            "fine_tune": first_info.fine_tune_type,
+            "bases": base_list,
+        })
+
+    widths = {
+        "adapter": max(len("ADAPTER"), max(len(r["adapter"]) for r in rows)),
+        "rank": max(len("RANK"), max(len(r["rank"]) for r in rows)),
+        "fine_tune": max(len("FINE_TUNE"), max(len(r["fine_tune"]) for r in rows)),
+        "bases": max(len("BASES"), max(len(r["bases"]) for r in rows)),
+    }
+    print(f"{'ADAPTER':<{widths['adapter']}}  {'RANK':>{widths['rank']}}  {'FINE_TUNE':<{widths['fine_tune']}}  BASES")
+    for r in rows:
+        print(f"{r['adapter']:<{widths['adapter']}}  {r['rank']:>{widths['rank']}}  {r['fine_tune']:<{widths['fine_tune']}}  {r['bases']}")
+
+    return 0
+
+
+def adapter_show_command(args) -> int:
+    """Show detailed information for a single adapter."""
+    from pathlib import Path
+
+    from .adapter_utils import resolve_adapter_metadata, resolve_omlx_sidecar
+    from .model_discovery import discover_adapters, discover_models
+
+    models_dir = Path(args.models_dir) if args.models_dir else Path.home() / ".omlx" / "models"
+    adapter_dir_root = models_dir.parent / "adapters"
+    target_dir = adapter_dir_root / args.adapter_id
+
+    if not target_dir.exists():
+        print(f"error: adapter not found: {target_dir}", file=sys.stderr)
+        return 1
+
+    try:
+        md = resolve_adapter_metadata(target_dir)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"error: cannot read adapter_config.json: {e}", file=sys.stderr)
+        return 1
+
+    try:
+        sidecar = resolve_omlx_sidecar(target_dir)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"error: cannot read omlx.json sidecar: {e}", file=sys.stderr)
+        return 1
+
+    # Walk models to find which discovered bases this adapter attaches to
+    models = discover_models(models_dir) if models_dir.exists() else {}
+    if adapter_dir_root.exists():
+        discover_adapters(adapter_dir_root, models)
+    attaches_to = [
+        base_id for base_id, entry in models.items()
+        if any(info.adapter_id == args.adapter_id for info in entry.available_adapters)
+    ]
+
+    print(f"id:              {args.adapter_id}")
+    print(f"path:            {target_dir}")
+    print(f"rank:            {md.rank}")
+    print(f"num_layers:      {md.num_layers}")
+    print(f"fine_tune_type:  {md.fine_tune_type}")
+    print(f"target_keys:     {', '.join(md.keys) if md.keys else '(none)'}")
+    print("supported_models:")
+    for m in sidecar.supported_models:
+        print(f"  - {m}")
+    print("attaches_to:")
+    if attaches_to:
+        for base in sorted(attaches_to):
+            print(f"  - {base} (locally discovered)")
+    else:
+        print("  (none — supported_models does not match any locally-discovered base)")
+
+    return 0
+
+
 def diagnose_command(args) -> int:
     """Dispatch 'omlx diagnose <target>' to the appropriate subcommand."""
     target = getattr(args, "target", None)
@@ -715,6 +825,35 @@ Example directory structure:
         help="What to diagnose. 'menubar' checks Tahoe ControlCenter visibility.",
     )
 
+    # Adapter command
+    adapter_parser = subparsers.add_parser(
+        "adapter",
+        help="List and inspect LoRA adapters",
+        description="Offline introspection of adapters discovered from ~/.omlx/adapters/.",
+    )
+    adapter_subparsers = adapter_parser.add_subparsers(dest="adapter_cmd", required=True)
+
+    adapter_list_parser = adapter_subparsers.add_parser(
+        "list",
+        help="List all discovered adapters and their attached bases",
+    )
+    adapter_list_parser.add_argument(
+        "--models-dir",
+        default=None,
+        help="Override the models root (defaults to ~/.omlx/models/)",
+    )
+
+    adapter_show_parser = adapter_subparsers.add_parser(
+        "show",
+        help="Show details for a single adapter",
+    )
+    adapter_show_parser.add_argument("adapter_id", help="Adapter directory name")
+    adapter_show_parser.add_argument(
+        "--models-dir",
+        default=None,
+        help="Override the models root (defaults to ~/.omlx/models/)",
+    )
+
     args = parser.parse_args()
 
     if args.command == "serve":
@@ -723,6 +862,14 @@ Example directory structure:
         launch_command(args)
     elif args.command == "diagnose":
         sys.exit(diagnose_command(args))
+    elif args.command == "adapter":
+        if args.adapter_cmd == "list":
+            sys.exit(adapter_list_command(args))
+        elif args.adapter_cmd == "show":
+            sys.exit(adapter_show_command(args))
+        else:
+            adapter_parser.print_help()
+            sys.exit(1)
     else:
         parser.print_help()
         sys.exit(1)
