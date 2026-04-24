@@ -5,6 +5,7 @@ Public types:
 - ``AdapterMetadata`` — full normalized adapter config read from adapter_config.json.
 - ``AdapterInfo`` — lightweight UI/API-facing summary attached to a base model's
   ``DiscoveredModel.available_adapters`` list.
+- ``OmlxAdapterSidecar`` — oMLX-specific sidecar metadata read from omlx.json.
 """
 from __future__ import annotations
 
@@ -53,12 +54,42 @@ class AdapterInfo:
         )
 
 
+@dataclass(frozen=True)
+class OmlxAdapterSidecar:
+    """oMLX-specific sidecar metadata read from omlx.json."""
+    supported_models: tuple[str, ...]
+    raw: dict[str, Any]
+
+
+def resolve_omlx_sidecar(adapter_dir: Path) -> OmlxAdapterSidecar:
+    """Read omlx.json sidecar. Raises FileNotFoundError if missing,
+    ValueError if supported_models is missing or malformed."""
+    sidecar_path = Path(adapter_dir) / "omlx.json"
+    if not sidecar_path.exists():
+        raise FileNotFoundError(
+            f"omlx.json sidecar missing at {sidecar_path} — oMLX adapters "
+            f"require a sidecar naming supported base models"
+        )
+    with sidecar_path.open() as f:
+        raw = json.load(f)
+    sm = raw.get("supported_models")
+    if not isinstance(sm, list) or not all(isinstance(x, str) for x in sm):
+        raise ValueError(
+            f"omlx.json at {sidecar_path} must contain a 'supported_models' "
+            f"list of strings; got {sm!r}"
+        )
+    return OmlxAdapterSidecar(supported_models=tuple(sm), raw=raw)
+
+
 def resolve_adapter_metadata(adapter_dir: Path) -> AdapterMetadata:
     """Read adapter_config.json from adapter_dir and return normalized metadata.
 
     Raises:
         FileNotFoundError: if adapter_config.json is missing.
-        ValueError: if base_model_name_or_path is missing, or fine_tune_type is "full".
+        ValueError: if fine_tune_type is "full".
+
+    Note: base_model_name_or_path is optional. Model matching is done via
+    omlx.json sidecar (supported_models), not via this field.
     """
     config_path = Path(adapter_dir) / "adapter_config.json"
     if not config_path.exists():
@@ -66,11 +97,7 @@ def resolve_adapter_metadata(adapter_dir: Path) -> AdapterMetadata:
     with config_path.open() as f:
         raw = json.load(f)
     # Accept both PEFT-style key and mlx-lm training-config key ("model")
-    base_ref = raw.get("base_model_name_or_path") or raw.get("model")
-    if not base_ref:
-        raise ValueError(
-            f"adapter_config.json at {config_path} missing base_model_name_or_path"
-        )
+    base_ref = raw.get("base_model_name_or_path") or raw.get("model") or ""
     fine_tune_type = raw.get("fine_tune_type", "lora")
     if fine_tune_type == "full":
         raise ValueError(

@@ -644,54 +644,73 @@ def estimate_model_size(model_path: Path) -> int:
     return int(total_size * overhead_factor)
 
 
-def _is_adapter_dir(path: Path) -> bool:
-    """Check if a directory contains a LoRA/PEFT adapter (has adapter_config.json)."""
-    return (path / "adapter_config.json").exists()
-
-
 def _try_attach_adapter(
     adapter_dir: Path,
     models: dict[str, DiscoveredModel],
 ) -> bool:
-    """Attach an adapter to its base model's available_adapters list.
+    """Discover an adapter and attach it to each supported base's available_adapters.
 
-    Returns True if attached; False if base not found or metadata invalid.
+    Returns True if attached to at least one base, False if skipped.
+    Skip reasons (all logged): missing/malformed adapter_config.json,
+    missing/malformed omlx.json sidecar, no supported_models match any
+    discovered base.
     """
-    from .adapter_utils import resolve_adapter_metadata, AdapterInfo
+    from .adapter_utils import (
+        resolve_adapter_metadata, resolve_omlx_sidecar, AdapterInfo,
+    )
     try:
         md = resolve_adapter_metadata(adapter_dir)
     except (FileNotFoundError, ValueError) as e:
         logger.warning(f"Skipping adapter {adapter_dir.name}: {e}")
         return False
-
-    # Try direct model_id match, then basename match (HF-style "org/name")
-    base_id = None
-    if md.base_ref in models:
-        base_id = md.base_ref
-    else:
-        basename = md.base_ref.split("/")[-1]
-        if basename in models:
-            base_id = basename
-
-    if base_id is None:
-        logger.warning(
-            f"Adapter {adapter_dir.name} references unknown base "
-            f"{md.base_ref!r} — skipping"
-        )
+    try:
+        sidecar = resolve_omlx_sidecar(adapter_dir)
+    except (FileNotFoundError, ValueError) as e:
+        logger.warning(f"Skipping adapter {adapter_dir.name}: {e}")
         return False
 
     info = AdapterInfo.from_metadata(adapter_dir.name, str(adapter_dir), md)
-    models[base_id].available_adapters.append(info)
-    logger.info(
-        f"Attached adapter {adapter_dir.name} to base {base_id} "
-        f"(rank={md.rank}, layers={md.num_layers})"
-    )
+
+    # Match each supported_models entry to discovered bases
+    matched_bases = []
+    for supported in sidecar.supported_models:
+        if supported in models:
+            matched_bases.append(supported)
+            continue
+        # HF-style "org/name" — try basename
+        basename = supported.split("/")[-1]
+        if basename in models:
+            matched_bases.append(basename)
+
+    if not matched_bases:
+        logger.warning(
+            f"Adapter {adapter_dir.name}: supported_models "
+            f"{list(sidecar.supported_models)!r} — none match discovered bases; skipping"
+        )
+        return False
+
+    for base_id in matched_bases:
+        models[base_id].available_adapters.append(info)
+        logger.info(
+            f"Attached adapter {adapter_dir.name} to base {base_id} "
+            f"(rank={md.rank}, layers={md.num_layers})"
+        )
     return True
+
+
+def discover_adapters(adapter_dir: Path, models: dict[str, DiscoveredModel]) -> None:
+    """Walk an adapters root and attach each discovered adapter to matching bases."""
+    if not adapter_dir.exists():
+        return
+    for subdir in sorted(adapter_dir.iterdir()):
+        if not subdir.is_dir() or subdir.name.startswith("."):
+            continue
+        _try_attach_adapter(subdir, models)
 
 
 def _is_model_dir(path: Path) -> bool:
     """Check if a directory contains a valid model (has config.json)."""
-    return (path / "config.json").exists() and not _is_adapter_dir(path)
+    return (path / "config.json").exists()
 
 
 def _resolve_hf_cache_entry(path: Path) -> tuple[Path, str] | None:
@@ -815,16 +834,12 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
         raise ValueError(f"Model directory is not a directory: {model_dir}")
 
     models: dict[str, DiscoveredModel] = {}
-    adapter_dirs_pending: list[Path] = []
 
     for subdir in sorted(model_dir.iterdir()):
         if not subdir.is_dir() or subdir.name.startswith("."):
             continue
 
-        if _is_adapter_dir(subdir):
-            adapter_dirs_pending.append(subdir)
-            continue
-        elif _is_model_dir(subdir):
+        if _is_model_dir(subdir):
             # Level 1: direct model folder
             _register_model(models, subdir, subdir.name)
         else:
@@ -841,10 +856,7 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
             for child in sorted(subdir.iterdir()):
                 if not child.is_dir() or child.name.startswith("."):
                     continue
-                if _is_adapter_dir(child):
-                    adapter_dirs_pending.append(child)
-                    continue
-                elif _is_model_dir(child):
+                if _is_model_dir(child):
                     has_children = True
                     _register_model(models, child, child.name)
 
@@ -860,10 +872,6 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
     if not models and _is_model_dir(model_dir):
         _register_model(models, model_dir, model_dir.name)
 
-    # Second pass: attach collected adapter dirs to their base models.
-    for adapter_dir in adapter_dirs_pending:
-        _try_attach_adapter(adapter_dir, models)
-
     return models
 
 
@@ -875,6 +883,9 @@ def discover_models_from_dirs(
 
     Each directory is scanned using discover_models(). On model_id conflicts,
     the first directory's model takes priority (earlier directory wins).
+
+    After all bases are merged, adapters are attached by scanning each
+    model_dir's sibling ``adapters/`` directory (i.e. ``model_dir.parent / "adapters"``).
 
     Args:
         model_dirs: List of paths to directories containing model subdirectories
@@ -906,6 +917,11 @@ def discover_models_from_dirs(
                 )
                 continue
             merged[model_id] = info
+
+    # Attach adapters from each models_dir's sibling adapters/ root.
+    for model_dir in model_dirs:
+        adapter_dir = model_dir.parent / "adapters"
+        discover_adapters(adapter_dir, merged)
 
     return merged
 

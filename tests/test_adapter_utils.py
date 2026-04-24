@@ -33,10 +33,11 @@ def test_resolve_raises_on_missing_config(tmp_path):
         resolve_adapter_metadata(tmp_path)
 
 
-def test_resolve_raises_on_missing_base_ref(tmp_path):
+def test_resolve_returns_empty_base_ref_when_absent(tmp_path):
+    """base_model_name_or_path is optional; model matching now uses omlx.json sidecar."""
     (tmp_path / "adapter_config.json").write_text("{}")
-    with pytest.raises(ValueError, match="base_model_name_or_path"):
-        resolve_adapter_metadata(tmp_path)
+    md = resolve_adapter_metadata(tmp_path)
+    assert md.base_ref == ""
 
 
 def test_resolve_rejects_full_fine_tune(tmp_path):

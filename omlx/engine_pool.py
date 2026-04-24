@@ -222,7 +222,7 @@ class EnginePool:
         """
         from pathlib import Path
 
-        from .model_discovery import discover_models_from_dirs
+        from .model_discovery import discover_adapters, discover_models_from_dirs
 
         if isinstance(model_dirs, str):
             dirs = [Path(model_dirs)]
@@ -231,7 +231,12 @@ class EnginePool:
 
         if len(dirs) == 1:
             discovered = discover_models(dirs[0])
+            # Attach adapters from the sibling adapters/ root.
+            for model_dir in dirs:
+                adapter_dir = model_dir.parent / "adapters"
+                discover_adapters(adapter_dir, discovered)
         else:
+            # discover_models_from_dirs handles adapter attachment internally.
             discovered = discover_models_from_dirs(dirs)
 
         pinned_set = set(pinned_models or [])

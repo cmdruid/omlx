@@ -9,7 +9,6 @@ import pytest
 
 from omlx.model_discovery import (
     DiscoveredModel,
-    _is_adapter_dir,
     _is_unsupported_model,
     _resolve_hf_cache_entry,
     detect_model_type,
@@ -651,31 +650,19 @@ class TestFormatSize:
 
 
 class TestAdapterDetection:
-    """Tests for LoRA/PEFT adapter detection."""
-
-    def test_adapter_dir_detected(self, tmp_path):
-        """Directory with adapter_config.json is detected as adapter."""
-        (tmp_path / "adapter_config.json").write_text("{}")
-        assert _is_adapter_dir(tmp_path) is True
-
-    def test_normal_model_not_adapter(self, tmp_path):
-        """Normal model directory is not detected as adapter."""
-        (tmp_path / "config.json").write_text('{"model_type": "llama"}')
-        (tmp_path / "model.safetensors").write_bytes(b"0" * 1000)
-        assert _is_adapter_dir(tmp_path) is False
+    """Tests for LoRA/PEFT adapter detection (old-layout silently skipped)."""
 
     def test_discover_skips_lora_adapter(self, tmp_path):
-        """discover_models should skip LoRA adapter directories."""
+        """discover_models should skip old-layout LoRA adapter directories (no config.json)."""
         # Normal model
         model_dir = tmp_path / "llama-3b"
         model_dir.mkdir()
         (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
         (model_dir / "model.safetensors").write_bytes(b"0" * 1000)
 
-        # LoRA adapter (has both config.json and adapter_config.json)
+        # Old-layout LoRA adapter (adapter_config.json, no config.json) — silently skipped
         adapter_dir = tmp_path / "my-lora"
         adapter_dir.mkdir()
-        (adapter_dir / "config.json").write_text(json.dumps({"model_type": "qwen2"}))
         (adapter_dir / "adapter_config.json").write_text("{}")
         (adapter_dir / "adapters.safetensors").write_bytes(b"0" * 100)
 
@@ -684,7 +671,7 @@ class TestAdapterDetection:
         assert "my-lora" not in models
 
     def test_discover_skips_nested_lora_adapter(self, tmp_path):
-        """discover_models should skip LoRA adapters in org folders."""
+        """discover_models should skip old-layout LoRA adapters in org folders."""
         org_dir = tmp_path / "my-org"
         org_dir.mkdir()
 
@@ -694,10 +681,9 @@ class TestAdapterDetection:
         (model_dir / "config.json").write_text(json.dumps({"model_type": "llama"}))
         (model_dir / "model.safetensors").write_bytes(b"0" * 1000)
 
-        # LoRA adapter under org
+        # Old-layout LoRA adapter under org (no config.json)
         adapter_dir = org_dir / "my-lora"
         adapter_dir.mkdir()
-        (adapter_dir / "config.json").write_text(json.dumps({"model_type": "qwen2"}))
         (adapter_dir / "adapter_config.json").write_text("{}")
 
         models = discover_models(tmp_path)

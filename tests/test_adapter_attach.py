@@ -1,114 +1,238 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for two-pass adapter attach in discover_models."""
+"""Tests for two-root adapter discovery with omlx.json sidecar."""
 import json
 from pathlib import Path
 
 import pytest
 
-from omlx.model_discovery import discover_models
+from omlx.adapter_utils import resolve_omlx_sidecar
+from omlx.model_discovery import (
+    discover_models,
+    discover_adapters,
+)
 
 
-def _plant_base(path: Path, name: str):
-    d = path / name
-    d.mkdir()
-    (d / "config.json").write_text('{"model_type": "mixtral"}')
-    # estimate_model_size requires at least one weight file
-    (d / "model.safetensors").write_bytes(b"\x00" * 1024)
-    return d
+# --- fixtures ---
 
 
-def _plant_adapter(path: Path, name: str, base_ref: str):
-    d = path / name
-    d.mkdir()
-    (d / "adapter_config.json").write_text(json.dumps({
-        "base_model_name_or_path": base_ref,
+def _plant_sidecar(dir: Path, supported: list[str]):
+    (dir / "omlx.json").write_text(json.dumps({"supported_models": supported}))
+
+
+def _plant_adapter_config(dir: Path, rank: int = 16, keys: list[str] | None = None):
+    (dir / "adapter_config.json").write_text(json.dumps({
         "fine_tune_type": "lora",
         "num_layers": 16,
         "lora_parameters": {
-            "rank": 16, "scale": 2.0, "dropout": 0.0,
-            "keys": ["self_attn.q_proj"],
+            "rank": rank, "scale": 2.0, "dropout": 0.0,
+            "keys": keys or ["self_attn.q_proj"],
         },
     }))
-    (d / "adapters.safetensors").write_bytes(b"")
+    (dir / "adapters.safetensors").write_bytes(b"")
+
+
+def _plant_base(dir: Path, name: str):
+    d = dir / name
+    d.mkdir()
+    (d / "config.json").write_text('{"model_type": "mixtral"}')
+    (d / "model.safetensors").write_bytes(b"\x00" * 100_000)
     return d
 
 
-def test_adapter_attaches_to_base_by_model_id(tmp_path):
-    _plant_base(tmp_path, "gpt-oss-20b")
-    _plant_adapter(tmp_path, "rnd-001-adapter", base_ref="gpt-oss-20b")
-
-    result = discover_models(tmp_path)
-
-    # Adapter does NOT appear as a top-level discovered model
-    assert "rnd-001-adapter" not in result
-    # Base is discovered with the adapter attached
-    assert "gpt-oss-20b" in result
-    base = result["gpt-oss-20b"]
-    assert len(base.available_adapters) == 1
-    assert base.available_adapters[0].adapter_id == "rnd-001-adapter"
-    assert base.available_adapters[0].rank == 16
+def _plant_adapter(adapter_root: Path, name: str, supported: list[str] | None, rank: int = 16):
+    d = adapter_root / name
+    d.mkdir()
+    _plant_adapter_config(d, rank=rank)
+    if supported is not None:
+        _plant_sidecar(d, supported)
+    return d
 
 
-def test_adapter_attaches_by_hf_basename(tmp_path):
-    """Adapter config references 'mlx-community/gpt-oss-20b' but base is under 'gpt-oss-20b' locally."""
-    _plant_base(tmp_path, "gpt-oss-20b-MXFP4-Q8")
+# --- sidecar parsing ---
+
+
+def test_sidecar_reads_supported_models(tmp_path):
+    d = tmp_path / "adapter"
+    d.mkdir()
+    _plant_sidecar(d, ["gpt-oss-20b"])
+    sc = resolve_omlx_sidecar(d)
+    assert sc.supported_models == ("gpt-oss-20b",)
+
+
+def test_sidecar_missing_raises_filenotfound(tmp_path):
+    d = tmp_path / "adapter"
+    d.mkdir()
+    with pytest.raises(FileNotFoundError):
+        resolve_omlx_sidecar(d)
+
+
+def test_sidecar_without_supported_models_raises_valueerror(tmp_path):
+    d = tmp_path / "adapter"
+    d.mkdir()
+    (d / "omlx.json").write_text("{}")
+    with pytest.raises(ValueError, match="supported_models"):
+        resolve_omlx_sidecar(d)
+
+
+def test_sidecar_with_malformed_supported_models_raises_valueerror(tmp_path):
+    d = tmp_path / "adapter"
+    d.mkdir()
+    (d / "omlx.json").write_text(json.dumps({"supported_models": "not-a-list"}))
+    with pytest.raises(ValueError):
+        resolve_omlx_sidecar(d)
+
+
+# --- two-root discovery + attach ---
+
+
+def test_adapter_attaches_to_single_supported_base(tmp_path):
+    models_root = tmp_path / "models"
+    models_root.mkdir()
+    _plant_base(models_root, "gpt-oss-20b")
+
+    adapter_root = tmp_path / "adapters"
+    adapter_root.mkdir()
+    _plant_adapter(adapter_root, "rnd-001", supported=["gpt-oss-20b"])
+
+    models = discover_models(models_root)
+    discover_adapters(adapter_root, models)
+
+    assert "rnd-001" not in models  # adapter is NOT a top-level model
+    assert len(models["gpt-oss-20b"].available_adapters) == 1
+    assert models["gpt-oss-20b"].available_adapters[0].adapter_id == "rnd-001"
+    assert models["gpt-oss-20b"].available_adapters[0].rank == 16
+
+
+def test_adapter_attaches_to_multiple_supported_bases(tmp_path):
+    """A single adapter listed as supporting two bases attaches to both."""
+    models_root = tmp_path / "models"
+    models_root.mkdir()
+    _plant_base(models_root, "gpt-oss-20b-Q4")
+    _plant_base(models_root, "gpt-oss-20b-Q8")
+
+    adapter_root = tmp_path / "adapters"
+    adapter_root.mkdir()
     _plant_adapter(
-        tmp_path,
-        "rnd-001-adapter",
-        base_ref="mlx-community/gpt-oss-20b-MXFP4-Q8",
+        adapter_root, "rnd-001",
+        supported=["gpt-oss-20b-Q4", "gpt-oss-20b-Q8"],
     )
 
-    result = discover_models(tmp_path)
+    models = discover_models(models_root)
+    discover_adapters(adapter_root, models)
 
-    base = result["gpt-oss-20b-MXFP4-Q8"]
-    assert len(base.available_adapters) == 1
-    assert base.available_adapters[0].adapter_id == "rnd-001-adapter"
+    assert "rnd-001" in {a.adapter_id for a in models["gpt-oss-20b-Q4"].available_adapters}
+    assert "rnd-001" in {a.adapter_id for a in models["gpt-oss-20b-Q8"].available_adapters}
 
 
-def test_multiple_adapters_attach_to_same_base(tmp_path):
-    _plant_base(tmp_path, "base")
-    _plant_adapter(tmp_path, "rnd-001", base_ref="base")
-    _plant_adapter(tmp_path, "rnd-002", base_ref="base")
+def test_adapter_with_hf_style_basename_matches(tmp_path):
+    """supported_models: ['mlx-community/gpt-oss-20b-MXFP4-Q8'] matches local 'gpt-oss-20b-MXFP4-Q8'."""
+    models_root = tmp_path / "models"
+    models_root.mkdir()
+    _plant_base(models_root, "gpt-oss-20b-MXFP4-Q8")
 
-    result = discover_models(tmp_path)
-    base = result["base"]
-    adapter_ids = {a.adapter_id for a in base.available_adapters}
-    assert adapter_ids == {"rnd-001", "rnd-002"}
+    adapter_root = tmp_path / "adapters"
+    adapter_root.mkdir()
+    _plant_adapter(adapter_root, "rnd-001",
+                   supported=["mlx-community/gpt-oss-20b-MXFP4-Q8"])
+
+    models = discover_models(models_root)
+    discover_adapters(adapter_root, models)
+
+    assert len(models["gpt-oss-20b-MXFP4-Q8"].available_adapters) == 1
 
 
 def test_adapter_with_unknown_base_is_skipped_with_warning(tmp_path, caplog):
-    _plant_adapter(tmp_path, "orphan", base_ref="nonexistent-base")
+    models_root = tmp_path / "models"
+    models_root.mkdir()
+    _plant_base(models_root, "base")
 
+    adapter_root = tmp_path / "adapters"
+    adapter_root.mkdir()
+    _plant_adapter(adapter_root, "orphan", supported=["nonexistent-base"])
+
+    models = discover_models(models_root)
     with caplog.at_level("WARNING"):
-        result = discover_models(tmp_path)
+        discover_adapters(adapter_root, models)
 
-    # Orphan adapter not registered anywhere
-    assert "orphan" not in result
-    # And not attached (there's no base to attach to)
-    # A warning was logged naming the missing base
-    assert any("nonexistent-base" in r.message for r in caplog.records)
+    assert models["base"].available_adapters == []
+    assert any("orphan" in r.message for r in caplog.records)
 
 
-def test_adapter_with_malformed_config_is_skipped_with_warning(tmp_path, caplog):
-    _plant_base(tmp_path, "base")
-    bad = tmp_path / "bad-adapter"
-    bad.mkdir()
-    (bad / "adapter_config.json").write_text("not json")
+def test_adapter_without_sidecar_is_skipped_with_warning(tmp_path, caplog):
+    models_root = tmp_path / "models"
+    models_root.mkdir()
+    _plant_base(models_root, "base")
 
+    adapter_root = tmp_path / "adapters"
+    adapter_root.mkdir()
+    d = adapter_root / "no-sidecar"
+    d.mkdir()
+    _plant_adapter_config(d)  # config but no omlx.json
+
+    models = discover_models(models_root)
     with caplog.at_level("WARNING"):
-        result = discover_models(tmp_path)
+        discover_adapters(adapter_root, models)
 
-    assert "bad-adapter" not in result
-    assert result["base"].available_adapters == []
-    # A warning was logged
-    assert any("bad-adapter" in r.message for r in caplog.records)
+    assert models["base"].available_adapters == []
+    assert any("no-sidecar" in r.message for r in caplog.records)
 
 
-def test_discovery_count_does_not_include_adapters(tmp_path, caplog):
-    """Adapters should not inflate the discovered-models count."""
-    _plant_base(tmp_path, "base")
-    _plant_adapter(tmp_path, "adapter-1", base_ref="base")
+def test_adapter_with_malformed_adapter_config_is_skipped(tmp_path, caplog):
+    models_root = tmp_path / "models"
+    models_root.mkdir()
+    _plant_base(models_root, "base")
 
-    result = discover_models(tmp_path)
-    # Only 1 discovered MODEL (the base); the adapter is attached, not listed.
-    assert len(result) == 1
+    adapter_root = tmp_path / "adapters"
+    adapter_root.mkdir()
+    d = adapter_root / "bad"
+    d.mkdir()
+    (d / "adapter_config.json").write_text("not json")
+    _plant_sidecar(d, ["base"])
+
+    models = discover_models(models_root)
+    with caplog.at_level("WARNING"):
+        discover_adapters(adapter_root, models)
+
+    assert models["base"].available_adapters == []
+    assert any("bad" in r.message for r in caplog.records)
+
+
+def test_adapter_root_missing_is_no_op(tmp_path):
+    """If ~/.omlx/adapters/ doesn't exist, discover_adapters returns without error."""
+    models_root = tmp_path / "models"
+    models_root.mkdir()
+    _plant_base(models_root, "base")
+    models = discover_models(models_root)
+    # adapters/ does not exist
+    discover_adapters(tmp_path / "adapters", models)  # should not raise
+    assert models["base"].available_adapters == []
+
+
+def test_empty_adapter_root_is_no_op(tmp_path):
+    models_root = tmp_path / "models"
+    models_root.mkdir()
+    _plant_base(models_root, "base")
+    adapter_root = tmp_path / "adapters"
+    adapter_root.mkdir()
+    models = discover_models(models_root)
+    discover_adapters(adapter_root, models)
+    assert models["base"].available_adapters == []
+
+
+def test_old_layout_adapter_under_models_root_is_not_discovered(tmp_path):
+    """Pre-refactor adapters under ~/.omlx/models/<name>/ are silently ignored (hard cut)."""
+    models_root = tmp_path / "models"
+    models_root.mkdir()
+    _plant_base(models_root, "base")
+    # Adapter placed in the OLD (wrong) location
+    old_style = models_root / "rnd-001-adapter"
+    old_style.mkdir()
+    _plant_adapter_config(old_style)
+    _plant_sidecar(old_style, ["base"])  # even with sidecar, should not be picked up
+
+    models = discover_models(models_root)
+
+    # rnd-001-adapter should NOT be in models (no config.json → not a base)
+    assert "rnd-001-adapter" not in models
+    # No adapter root was scanned, so no adapters attached
+    assert models["base"].available_adapters == []
