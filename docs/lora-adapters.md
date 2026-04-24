@@ -1,33 +1,61 @@
 # LoRA Adapter Support
 
-oMLX can load a LoRA adapter alongside a base model. Adapters are **not** peer models — each base can have one adapter attached via its per-model settings. To swap adapters, change the setting (or the adapter directory itself) and reload the model.
+oMLX can load a LoRA adapter alongside a base model. Adapters live in their own root at `~/.omlx/adapters/<name>/`, separate from base models at `~/.omlx/models/<name>/`. Each adapter declares which bases it supports via an `omlx.json` sidecar. To swap adapters, change the `adapter_id` setting on the base model (or update a symlink in `~/.omlx/adapters/`) and trigger a reload.
 
 ## Directory Layout
 
-Drop adapter directories alongside base models in `~/.omlx/models/`:
-
 ```
-~/.omlx/models/
-├── gpt-oss-20b-MXFP4-Q8/          # base
-│   ├── config.json
-│   └── model-00001-of-00003.safetensors
-├── rnd-001-adapter/                # LoRA adapter for gpt-oss-20b-MXFP4-Q8
-│   ├── adapter_config.json
-│   └── adapters.safetensors
-└── rnd-002-adapter/                # another LoRA adapter for the same base
-    ├── adapter_config.json
-    └── adapters.safetensors
+~/.omlx/
+├── models/
+│   └── gpt-oss-20b-MXFP4-Q8/            # base model
+│       ├── config.json
+│       └── model-00001-of-00003.safetensors
+└── adapters/
+    └── rnd-001/                          # LoRA adapter
+        ├── adapter_config.json           # PEFT/mlx-lm format (rank, keys, etc.)
+        ├── adapters.safetensors          # weights
+        └── omlx.json                     # oMLX sidecar — required
 ```
 
-An adapter directory is identified by the presence of `adapter_config.json`. The adapter's base reference lives in its config (either `base_model_name_or_path`, PEFT convention, or `model`, mlx-lm convention). oMLX matches the ref against both model_ids and their basenames — so `"mlx-community/gpt-oss-20b-MXFP4-Q8"` attaches to a local dir named `gpt-oss-20b-MXFP4-Q8`.
+Adapters never live under `~/.omlx/models/`. Any adapter directory placed there is silently ignored. The split root is intentional — discovery treats the two roots as completely separate namespaces.
 
-## `adapter_config.json` reference
+## omlx.json sidecar (required)
+
+Minimum contents:
+
+```json
+{
+  "supported_models": ["gpt-oss-20b-MXFP4-Q8"]
+}
+```
+
+`supported_models` is a list — an adapter can declare compatibility with multiple bases. Each entry is matched against discovered bases by direct `model_id` first, then by basename (strips everything before the last `/`, so `"mlx-community/gpt-oss-20b-MXFP4-Q8"` matches a locally-discovered dir named `gpt-oss-20b-MXFP4-Q8`).
+
+If `omlx.json` is missing or malformed, oMLX logs a warning at startup and skips the adapter. You must write the sidecar manually after training (or have your training pipeline produce it) — there is no fallback.
+
+Example — one adapter compatible with two quant variants of the same base:
+
+```json
+{
+  "supported_models": [
+    "gpt-oss-20b-MXFP4-Q4",
+    "gpt-oss-20b-MXFP4-Q8"
+  ]
+}
+```
+
+oMLX trusts this list. Compatibility errors (architectural mismatch, rank/layer shape disagreement) surface at engine load time via `mlx_lm.load` / `mlx_vlm.utils.load`, not at discovery.
+
+## `adapter_config.json` (unchanged format)
+
+oMLX reads `adapter_config.json` for mlx-lm's own consumption — rank, scale, dropout, num_layers, target keys, fine_tune_type. This is the file your training tool writes. Don't hand-edit it.
+
+oMLX does **not** use `base_model_name_or_path` (PEFT) or `model` (mlx-lm) for discovery matching — that is what `omlx.json` is for. Discovery is layout-agnostic with respect to what the upstream tool wrote into the config file's base-ref field.
 
 Minimum required fields:
 
 ```json
 {
-  "base_model_name_or_path": "mlx-community/gpt-oss-20b-MXFP4-Q8",
   "fine_tune_type": "lora",
   "num_layers": 16,
   "lora_parameters": {
@@ -44,78 +72,88 @@ Minimum required fields:
 }
 ```
 
-Full fine-tunes (`fine_tune_type: "full"`) are rejected — those should be registered as base models. Orphan adapters (base not locally discovered) are skipped with a warning at startup.
+Full fine-tunes (`fine_tune_type: "full"`) are rejected with a warning — full fine-tunes should be registered as base models under `~/.omlx/models/`, not as adapters.
 
-## Selecting an adapter
+## Loading an adapter
 
-### Via the admin dashboard
-
-1. Open the model's settings modal.
-2. Scroll to the Advanced section.
-3. In the "LoRA Adapter" dropdown, pick an adapter (or "None (base only)").
-4. Save.
-5. **Reload the model** for the change to take effect — either via the Unload + Load buttons in the dashboard, or by restarting the server.
-
-The dropdown lists only adapters whose base matches this model (auto-detected at startup).
-
-### Via the API
-
-PATCH the model settings:
+Drop the adapter directory into `~/.omlx/adapters/`, write the `omlx.json` sidecar, restart oMLX. Discovery picks it up at startup. Then:
 
 ```bash
 curl -X PUT http://localhost:8080/admin/api/models/gpt-oss-20b-MXFP4-Q8/settings \
   -H "Content-Type: application/json" \
-  -d '{"adapter_id": "rnd-001-adapter"}'
+  -d '{"adapter_id": "rnd-001"}'
 ```
 
-Then reload:
-
-```bash
-curl -X POST http://localhost:8080/admin/api/models/gpt-oss-20b-MXFP4-Q8/unload
-curl -X POST http://localhost:8080/admin/api/models/gpt-oss-20b-MXFP4-Q8/load
-```
-
-### Via symlink (no UI required)
-
-If you're driving from a fine-tune iteration loop, the simplest programmatic approach is:
-
-1. Point a stable symlink at the current adapter version:
-   ```bash
-   ln -sfn /path/to/rnd-002/adapter ~/.omlx/models/my-adapter
-   ```
-2. Configure the model's setting once: `adapter_id: "my-adapter"`.
-3. For each iteration, update the symlink to the new adapter dir + restart the server (or reload the model).
-
-The adapter_id stays stable; only the symlink changes. Simpler than pushing API calls on every training step.
+The model's next engine load merges the adapter. If the model was already loaded when you changed `adapter_id`, oMLX auto-unloads the engine so the next inference request reloads with the new weights.
 
 ## Inference
 
-After the model is loaded with an adapter, hit it at the normal OpenAI-compatible endpoint:
+Inference proceeds against the base's model_id, never the adapter's:
 
 ```bash
 curl http://localhost:8080/v1/chat/completions \
+  -H "Authorization: Bearer $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gpt-oss-20b-MXFP4-Q8",
-    "messages": [{"role": "user", "content": "Wake me in 3 seconds."}]
+    "messages": [{"role": "user", "content": "..."}]
   }'
 ```
 
 Note: the request's `model` field is the **base** model_id, not the adapter_id. Adapter selection is a property of the loaded engine, not the request.
 
-## Changing adapters
+## Fine-tune iteration pattern
 
-Reload the model. No hot-swap in v1 — the simplicity is the feature. The flow:
+For a training loop that produces rnd-001, rnd-002, ... adapters in sequence:
 
-1. Change the `adapter_id` setting (via UI or PATCH) OR update the symlink.
-2. Unload + Load the model, or restart the server.
-3. Subsequent requests use the new adapter.
+```bash
+# One-time setup — stable symlink so adapter_id stays constant across iterations
+ln -sfn /abs/path/to/rnd-001/adapter ~/.omlx/adapters/finetune-current
+cat > ~/.omlx/adapters/finetune-current/omlx.json <<EOF
+{"supported_models": ["gpt-oss-20b-MXFP4-Q8"]}
+EOF
 
-## Limitations
+curl -X PUT http://localhost:8080/admin/api/models/gpt-oss-20b-MXFP4-Q8/settings \
+  -H "Content-Type: application/json" \
+  -d '{"adapter_id": "finetune-current"}'
 
-- **BatchedEngine only.** VLM, embedding, reranker, STT, TTS engines don't support adapters yet. If an adapter's base is one of those model types, oMLX will still discover + attach metadata, but engine load will ignore the adapter_path.
-- **One adapter at a time per base.** To A/B test two adapters, configure them as separate ModelSettings entries or evict + reload.
-- **No hot-swap.** Changing `adapter_id` doesn't apply to an already-loaded engine until it's reloaded. This is intentional.
+# Per iteration — retarget symlink, unload
+ln -sfn /abs/path/to/rnd-N/adapter ~/.omlx/adapters/finetune-current
+curl -X POST http://localhost:8080/admin/api/models/gpt-oss-20b-MXFP4-Q8/unload
+```
+
+The symlink target changes each iteration; `adapter_id` and the sidecar both stay put. Next inference triggers a lazy load with the new weights.
+
+Caveat: if your symlink target writes its own `adapter_config.json` on each iteration, and that file's rank or keys change across iterations, `mlx_lm.load` may fail at load time. For iteration loops, keep rank and target_modules constant across rnd-N to avoid that.
+
+## Admin dashboard
+
+The settings modal's Advanced section has a "LoRA Adapter" dropdown showing all adapters whose `supported_models` matched this base. Selecting one saves to the model's settings and auto-unloads the engine.
+
+The active models status widget shows `(+ adapter-id)` next to loaded models that have an adapter attached.
+
+## Known limitations
+
+- **BatchedEngine and VLMBatchedEngine only.** Embedding, reranker, STT, TTS, STS engines ignore `adapter_id` at load.
+- **One adapter at a time per base.** Sequential attach, not stacking.
+- **No runtime hot-swap.** Changing `adapter_id` unloads and lazy-reloads. The simplicity is the feature.
+- **Discovery is startup-only.** Dropping a new adapter directory after the server starts requires a restart to pick it up.
+- **Full fine-tunes as adapters are rejected.** Register those as base models.
+
+## Writing the sidecar from a training script
+
+If your training pipeline outputs to `/some/path/rnd-N/adapter/`, add a step that writes the sidecar alongside:
+
+```python
+import json
+from pathlib import Path
+
+output_dir = Path("/some/path/rnd-N/adapter")
+sidecar = {"supported_models": ["gpt-oss-20b-MXFP4-Q8"]}
+(output_dir / "omlx.json").write_text(json.dumps(sidecar, indent=2))
+```
+
+Then symlink or copy the directory into `~/.omlx/adapters/<name>/`. Restart the server (or the oMLX daemon) to pick up the adapter.
 
 ## Verified against
 
