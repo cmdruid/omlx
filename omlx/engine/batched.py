@@ -9,8 +9,10 @@ for better throughput when serving multiple concurrent requests.
 import copy
 import logging
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
+from ..adapter_utils import resolve_adapter_metadata
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..utils.tokenizer import get_tokenizer_config
@@ -45,6 +47,7 @@ class BatchedEngine(BaseEngine):
         stream_interval: int = 1,
         enable_thinking: bool | None = None,
         model_settings: Any | None = None,
+        adapter_path: str | None = None,
     ):
         """
         Initialize the batched engine.
@@ -56,6 +59,7 @@ class BatchedEngine(BaseEngine):
             stream_interval: Tokens to batch before streaming (1=every token)
             enable_thinking: Enable thinking mode for reasoning models (passed to chat_template_kwargs)
             model_settings: Optional per-model settings for post-load transforms
+            adapter_path: Optional path to a LoRA adapter directory to load alongside the base model
         """
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
@@ -63,6 +67,8 @@ class BatchedEngine(BaseEngine):
         self._stream_interval = stream_interval
         self._enable_thinking = enable_thinking
         self._model_settings = model_settings
+        self._adapter_path = adapter_path
+        self._adapter_metadata = None
 
         self._model = None
         self._tokenizer = None
@@ -199,6 +205,10 @@ class BatchedEngine(BaseEngine):
             trust_remote_code=self._trust_remote_code,
         )
 
+        # Resolve adapter metadata now (before blocking executor call) if an adapter is set.
+        if self._adapter_path:
+            self._adapter_metadata = resolve_adapter_metadata(Path(self._adapter_path))
+
         # Load model on the global MLX executor to avoid blocking the event loop
         # while ensuring no concurrent Metal operations. See issue #85.
         from ..engine_core import get_mlx_executor
@@ -206,6 +216,7 @@ class BatchedEngine(BaseEngine):
         def _load_model_sync():
             return load(
                 self._model_name,
+                adapter_path=self._adapter_path,  # None is acceptable; mlx_lm.load treats it as no adapter
                 tokenizer_config=tokenizer_config,
             )
 

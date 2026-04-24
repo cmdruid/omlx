@@ -225,6 +225,7 @@ class VLMBatchedEngine(BaseEngine):
         stream_interval: int = 1,
         enable_thinking: bool | None = None,
         model_settings: Any | None = None,
+        adapter_path: str | None = None,
     ):
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
@@ -232,6 +233,8 @@ class VLMBatchedEngine(BaseEngine):
         self._stream_interval = stream_interval
         self._enable_thinking = enable_thinking
         self._model_settings = model_settings
+        self._adapter_path = adapter_path
+        self._adapter_metadata = None
 
         self._vlm_model = None
         self._processor = None
@@ -345,13 +348,19 @@ class VLMBatchedEngine(BaseEngine):
         from ..engine_core import AsyncEngineCore, EngineConfig
         from ..scheduler import SchedulerConfig
 
+        # Resolve adapter metadata before the blocking executor call, if an adapter is set.
+        if self._adapter_path:
+            from pathlib import Path as _AdapterPath
+            from ..adapter_utils import resolve_adapter_metadata
+            self._adapter_metadata = resolve_adapter_metadata(_AdapterPath(self._adapter_path))
+
         # Load VLM model on the global MLX executor to avoid blocking the event loop
         # while ensuring no concurrent Metal operations. See issue #85.
         from ..engine_core import get_mlx_executor
 
         def _load_vlm_sync():
             _patch_video_processor_bug()
-            return vlm_load(self._model_name)
+            return vlm_load(self._model_name, self._adapter_path)
 
         loop = asyncio.get_running_loop()
         self._vlm_model, self._processor = await loop.run_in_executor(
