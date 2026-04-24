@@ -124,6 +124,8 @@ curl -X POST http://localhost:8080/admin/api/models/gpt-oss-20b-MXFP4-Q8/unload
 
 The symlink target changes each iteration; `adapter_id` and the sidecar both stay put. Next inference triggers a lazy load with the new weights.
 
+If the adapter changes rank or target_modules across iterations (rare), call `/admin/api/adapters/rescan` first so the pool's `available_adapters` entry picks up the new metadata before reload.
+
 Caveat: if your symlink target writes its own `adapter_config.json` on each iteration, and that file's rank or keys change across iterations, `mlx_lm.load` may fail at load time. For iteration loops, keep rank and target_modules constant across rnd-N to avoid that.
 
 ## Admin dashboard
@@ -137,8 +139,45 @@ The active models status widget shows `(+ adapter-id)` next to loaded models tha
 - **BatchedEngine and VLMBatchedEngine only.** Embedding, reranker, STT, TTS, STS engines ignore `adapter_id` at load.
 - **One adapter at a time per base.** Sequential attach, not stacking.
 - **No runtime hot-swap.** Changing `adapter_id` unloads and lazy-reloads. The simplicity is the feature.
-- **Discovery is startup-only.** Dropping a new adapter directory after the server starts requires a restart to pick it up.
+- **Discovery runs at startup.** To pick up an adapter directory added after the server started, POST `/admin/api/adapters/rescan` — no restart needed. Removal is detected the same way.
 - **Full fine-tunes as adapters are rejected.** Register those as base models.
+
+## CLI introspection
+
+Inspect adapters from the shell without hitting the server:
+
+```bash
+omlx adapter list           # table of all adapters with their attached bases
+omlx adapter show rnd-001   # details for a single adapter
+```
+
+Both commands run offline — they walk `~/.omlx/models/` + `~/.omlx/adapters/` directly via `discover_models()` + `discover_adapters()`. Useful for training pipelines verifying a freshly-written adapter is discoverable, or for "why isn't this showing up?" debugging before the server is even running.
+
+## Troubleshooting
+
+### "My adapter doesn't show up in the model settings dropdown."
+
+1. Does the adapter directory exist at `~/.omlx/adapters/<name>/`? Adapters under `~/.omlx/models/` are silently ignored — hard cut, no backward compat.
+2. Does the directory contain all three files? `adapter_config.json`, `adapters.safetensors`, **and** `omlx.json`. Missing `omlx.json` is the most common gotcha.
+3. Does `omlx.json` have a `supported_models` list with at least one string that matches a discovered base's `model_id` (or the HF-style basename thereof)?
+4. Check server startup logs for `Skipping adapter ...` or `Adapter ... references unknown base ...` warnings — they name the specific reason.
+5. Was the adapter added after server start? Either POST to `/admin/api/adapters/rescan` or restart the server.
+6. Quick offline check: `omlx adapter list` — confirms whether discovery sees it at all.
+
+### "Adapter attached successfully but inference looks identical to base."
+
+1. Check the Active Models status widget in the dashboard for the `(+ <adapter-id>)` suffix next to the model name. If it's absent, the engine is loaded without the adapter.
+2. Or hit `/admin/api/models` and compare `settings.adapter_id` against `loaded_adapter_id` for the model:
+   - If they disagree, the engine was loaded before your settings change. POST to `/admin/api/models/<id>/unload`; next inference reloads with the new adapter.
+   - If they agree (both point at the right adapter) but output still matches base, the adapter's training may not produce a behavioral delta on your test prompt. Try a prompt closer to the training distribution.
+
+### "Model settings page shows 'Selected adapter is no longer available'."
+
+Common after a rename, deletion, or layout migration — the `adapter_id` setting persists across filesystem changes.
+
+1. Click the **Clear** button in the LoRA section to null the `adapter_id`, then Save. Or pick the current correct adapter from the dropdown and Save.
+2. Alternatively, edit `~/.omlx/model_settings.json` directly — delete the `adapter_id` key for the affected model or update it to the current valid value. Restart the server or POST to `/admin/api/adapters/rescan` after manual edits.
+3. The startup log also prints a prominent WARNING listing every stale setting and the valid options, so watching `/tmp/omlx-server.log` (or your server's log destination) at startup will tell you what needs fixing.
 
 ## Writing the sidecar from a training script
 
