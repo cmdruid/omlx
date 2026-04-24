@@ -175,6 +175,12 @@ Configure sampling parameters, chat template kwargs, TTL, model alias, model typ
   <img src="docs/images/omlx_ChatTemplateKwargs.png" alt="oMLX Chat Template Kwargs" width="480">
 </p>
 
+### LoRA / PEFT Adapters
+
+oMLX can load a LoRA adapter alongside a base model. Drop an adapter dir into `~/.omlx/models/` — its `adapter_config.json` names the base. The adapter is auto-detected and appears in the base's settings modal under Advanced > LoRA. Pick an adapter, save, reload the model.
+
+See [`docs/lora-adapters.md`](docs/lora-adapters.md) for the full walkthrough.
+
 ### Built-in Chat
 
 Chat directly with any loaded model from the admin panel. Supports conversation history, model switching, dark mode, reasoning model output, and image upload for VLM/OCR models.
