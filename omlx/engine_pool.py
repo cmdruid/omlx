@@ -18,7 +18,8 @@ import gc
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal
+from pathlib import Path
+from typing import TYPE_CHECKING, Literal, Optional
 
 if TYPE_CHECKING:
     from .model_settings import ModelSettingsManager
@@ -39,7 +40,8 @@ from .exceptions import (
     ModelNotFoundError,
     ModelTooLargeError,
 )
-from .model_discovery import DiscoveredModel, discover_models, format_size
+from .adapter_utils import AdapterInfo
+from .model_discovery import DiscoveredModel, discover_models, format_size, estimate_model_size
 from .engine_core import get_mlx_executor
 from .scheduler import SchedulerConfig
 
@@ -63,6 +65,96 @@ class EngineEntry:
     is_loading: bool = False  # Prevent concurrent loads
     is_pinned: bool = False  # Never evict if True
     abort_loading: bool = False  # Set by memory enforcer to abort in-progress load
+    available_adapters: list[AdapterInfo] = field(default_factory=list)  # LoRA adapters for this base model
+    _adapter_size_bump: int = 0  # Bytes added to estimated_size for the currently-tracked adapter
+
+
+def _loaded_adapter_id(entry: "EngineEntry") -> Optional[str]:
+    """Return the adapter_id currently attached to a loaded engine, or None.
+
+    Derives the id from ``engine._adapter_path`` (the final path segment).
+    Returns None when the engine is not loaded, or when it was loaded without
+    an adapter.
+    """
+    engine = getattr(entry, "engine", None)
+    if engine is None:
+        return None
+    adapter_path = getattr(engine, "_adapter_path", None)
+    if not adapter_path:
+        return None
+    return Path(adapter_path).name
+
+
+def _build_engine_kwargs_with_adapter(
+    entry: EngineEntry,
+    settings,
+    *,
+    log_kind: str = "adapter",
+) -> dict:
+    """Shared engine-kwargs builder with adapter resolution.
+
+    Returns a kwargs dict containing ``model_name`` (always) and
+    ``adapter_path`` (when ``settings.adapter_id`` matches one of
+    ``entry.available_adapters``). Mutates ``entry.estimated_size`` (tracked
+    via a private ``_adapter_size_bump`` field) so the LRU's memory
+    accounting reflects the full loaded footprint.
+
+    Idempotent: calling this twice with the same arguments leaves the entry
+    in the same state — the previous bump is reverted before the new one is
+    applied. Switching adapters or clearing the selection both behave
+    correctly.
+
+    Unknown ``adapter_id`` logs a warning and the engine loads without an
+    adapter — advisory, never a hard error.
+
+    ``log_kind`` appears in the "attaching {log_kind}" info log; callers pass
+    ``"adapter"`` for LLMs and ``"VLM adapter"`` for VLMs to disambiguate.
+    """
+    kwargs: dict = {"model_name": entry.model_path}
+
+    # Revert any previous adapter size bump so repeated calls are idempotent.
+    prev_bump = getattr(entry, "_adapter_size_bump", 0)
+    entry.estimated_size -= prev_bump
+    entry._adapter_size_bump = 0
+
+    if settings is not None and getattr(settings, "adapter_id", None):
+        adapter_id = settings.adapter_id
+        matching = next(
+            (a for a in entry.available_adapters if a.adapter_id == adapter_id),
+            None,
+        )
+        if matching is not None:
+            kwargs["adapter_path"] = matching.path
+            try:
+                adapter_size = estimate_model_size(Path(matching.path))
+                entry._adapter_size_bump = adapter_size
+                entry.estimated_size += adapter_size
+            except (ValueError, FileNotFoundError) as e:
+                logger.debug(
+                    f"Could not estimate adapter size for {matching.adapter_id}: {e}"
+                )
+            logger.info(
+                f"Model {entry.model_id}: attaching {log_kind} "
+                f"{matching.adapter_id} (rank={matching.rank}, path={matching.path})"
+            )
+        else:
+            logger.warning(
+                f"Model {entry.model_id}: requested adapter_id "
+                f"{adapter_id!r} not found in available_adapters "
+                f"{[a.adapter_id for a in entry.available_adapters]!r} — "
+                f"loading without adapter"
+            )
+    return kwargs
+
+
+def _build_batched_engine_kwargs(entry: EngineEntry, settings=None) -> dict:
+    """Kwargs for BatchedEngine. Thin wrapper over the shared helper."""
+    return _build_engine_kwargs_with_adapter(entry, settings, log_kind="adapter")
+
+
+def _build_vlm_engine_kwargs(entry: EngineEntry, settings=None) -> dict:
+    """Kwargs for VLMBatchedEngine. Thin wrapper over the shared helper."""
+    return _build_engine_kwargs_with_adapter(entry, settings, log_kind="VLM adapter")
 
 
 class EnginePool:
@@ -147,8 +239,9 @@ class EnginePool:
         for model_id, info in discovered.items():
             existing = self._entries.get(model_id)
             if existing is not None and existing.engine is not None:
-                # Loaded model: preserve runtime state, only update pinned flag
+                # Loaded model: preserve runtime state, refresh metadata
                 existing.is_pinned = model_id in pinned_set
+                existing.available_adapters = list(getattr(info, "available_adapters", []))
             else:
                 # New or unloaded model: create fresh entry
                 self._entries[model_id] = EngineEntry(
@@ -161,6 +254,7 @@ class EnginePool:
                     thinking_default=getattr(info, "thinking_default", None),
                     preserve_thinking_default=getattr(info, "preserve_thinking_default", None),
                     is_pinned=model_id in pinned_set,
+                    available_adapters=list(getattr(info, "available_adapters", [])),
                 )
 
             if model_id in pinned_set:
@@ -639,8 +733,9 @@ class EnginePool:
                 elif effective_type == "reranker":
                     engine = RerankerEngine(model_name=entry.model_path)
                 elif effective_type == "vlm":
+                    _vlm_kwargs = _build_vlm_engine_kwargs(entry, model_settings)
                     engine = VLMBatchedEngine(
-                        model_name=entry.model_path,
+                        **_vlm_kwargs,
                         scheduler_config=self._scheduler_config,
                         model_settings=model_settings,
                     )
@@ -654,8 +749,9 @@ class EnginePool:
                         config_model_type=entry.config_model_type,
                     )
                 else:
+                    _batched_kwargs = _build_batched_engine_kwargs(entry, model_settings)
                     engine = BatchedEngine(
-                        model_name=entry.model_path,
+                        **_batched_kwargs,
                         scheduler_config=self._scheduler_config,
                         model_settings=model_settings,
                     )
@@ -684,14 +780,16 @@ class EnginePool:
                     )
 
                     if effective_type == "vlm":
+                        _vlm_kwargs = _build_vlm_engine_kwargs(entry, model_settings)
                         engine = VLMBatchedEngine(
-                            model_name=entry.model_path,
+                            **_vlm_kwargs,
                             scheduler_config=self._scheduler_config,
                             model_settings=model_settings,
                         )
                     else:
+                        _batched_kwargs = _build_batched_engine_kwargs(entry, model_settings)
                         engine = BatchedEngine(
-                            model_name=entry.model_path,
+                            **_batched_kwargs,
                             scheduler_config=self._scheduler_config,
                             model_settings=model_settings,
                         )
@@ -720,8 +818,9 @@ class EnginePool:
                         lambda: (mx.synchronize(), mx.clear_cache()),
                     )
 
+                    _vlm_kwargs = _build_vlm_engine_kwargs(entry, model_settings)
                     engine = VLMBatchedEngine(
-                        model_name=entry.model_path,
+                        **_vlm_kwargs,
                         scheduler_config=self._scheduler_config,
                         model_settings=model_settings,
                     )
@@ -748,8 +847,9 @@ class EnginePool:
                         lambda: (mx.synchronize(), mx.clear_cache()),
                     )
 
+                    _batched_kwargs = _build_batched_engine_kwargs(entry, model_settings)
                     engine = BatchedEngine(
-                        model_name=entry.model_path,
+                        **_batched_kwargs,
                         scheduler_config=self._scheduler_config,
                         model_settings=model_settings,
                     )
@@ -871,6 +971,17 @@ class EnginePool:
                     "thinking_default": e.thinking_default,
                     "preserve_thinking_default": e.preserve_thinking_default,
                     "last_access": e.last_access if e.last_access > 0 else None,
+                    "available_adapters": [
+                        {
+                            "adapter_id": a.adapter_id,
+                            "path": a.path,
+                            "rank": a.rank,
+                            "num_layers": a.num_layers,
+                            "fine_tune_type": a.fine_tune_type,
+                        }
+                        for a in e.available_adapters
+                    ],
+                    "loaded_adapter_id": _loaded_adapter_id(e),
                 }
                 for mid, e in sorted(self._entries.items())
             ],
