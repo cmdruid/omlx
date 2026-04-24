@@ -1501,6 +1501,18 @@ async def reload_models(is_admin: bool = Depends(require_admin)):
     raise HTTPException(status_code=500, detail=message)
 
 
+@router.post("/api/adapters/rescan")
+async def rescan_adapters_route(is_admin: bool = Depends(require_admin)):
+    """Re-walk ~/.omlx/adapters/ and refresh each base's available_adapters.
+
+    Returns a summary dict with attached/removed/total counts.
+    """
+    pool = _get_engine_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="engine pool unavailable")
+    return await pool.rescan_adapters()
+
+
 @router.put("/api/models/{model_id}/settings")
 async def update_model_settings(
     model_id: str,

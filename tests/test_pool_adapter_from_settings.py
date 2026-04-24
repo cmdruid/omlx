@@ -235,3 +235,101 @@ def test_clearing_adapter_id_reverts_size_bump(tmp_path):
     assert entry.estimated_size > base_size
     _build_batched_engine_kwargs(entry, ModelSettings(adapter_id=None))
     assert entry.estimated_size == base_size  # reverted to base
+
+
+# ---------------------------------------------------------------------------
+# Item 5: runtime rescan endpoint — pool-level tests
+# ---------------------------------------------------------------------------
+
+import json
+import pytest
+
+
+def _plant_base(models_root, name):
+    d = models_root / name
+    d.mkdir()
+    (d / "config.json").write_text('{"model_type": "mixtral"}')
+    (d / "model.safetensors").write_bytes(b"\x00" * 100_000)
+    return d
+
+
+def _plant_adapter(adapter_root, name, supported, rank=16):
+    d = adapter_root / name
+    d.mkdir()
+    (d / "adapter_config.json").write_text(json.dumps({
+        "fine_tune_type": "lora",
+        "num_layers": 16,
+        "lora_parameters": {
+            "rank": rank, "scale": 2.0, "dropout": 0.0,
+            "keys": ["self_attn.q_proj"],
+        },
+    }))
+    (d / "adapters.safetensors").write_bytes(b"")
+    (d / "omlx.json").write_text(json.dumps({"supported_models": supported}))
+    return d
+
+
+@pytest.mark.asyncio
+async def test_rescan_picks_up_new_adapter(tmp_path, monkeypatch):
+    """rescan_adapters sees an adapter added after pool init."""
+    from pathlib import Path
+    from omlx.engine_pool import EnginePool
+    from omlx.model_discovery import discover_models
+
+    # Set up a fake ~/.omlx with models/ + adapters/
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    models_root = fake_home / ".omlx" / "models"
+    models_root.mkdir(parents=True)
+    adapter_root = fake_home / ".omlx" / "adapters"
+    adapter_root.mkdir()
+
+    _plant_base(models_root, "gpt-oss-20b")
+
+    # Start: zero adapters
+    pool = EnginePool(max_model_memory=None)
+    pool._entries.update(discover_models(models_root))
+    assert pool._entries["gpt-oss-20b"].available_adapters == []
+
+    # Now plant an adapter
+    _plant_adapter(adapter_root, "rnd-001", supported=["gpt-oss-20b"])
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))
+
+    result = await pool.rescan_adapters()
+    assert result["attached"] == 1
+    assert result["removed"] == 0
+    assert result["total"] == 1
+    assert len(pool._entries["gpt-oss-20b"].available_adapters) == 1
+
+
+@pytest.mark.asyncio
+async def test_rescan_removes_adapter_when_sidecar_deleted(tmp_path, monkeypatch):
+    """rescan_adapters drops an adapter whose omlx.json was deleted."""
+    from pathlib import Path
+    from omlx.engine_pool import EnginePool
+    from omlx.model_discovery import discover_models, discover_adapters
+
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    models_root = fake_home / ".omlx" / "models"
+    models_root.mkdir(parents=True)
+    adapter_root = fake_home / ".omlx" / "adapters"
+    adapter_root.mkdir()
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))
+
+    _plant_base(models_root, "gpt-oss-20b")
+    adapter_dir = _plant_adapter(adapter_root, "rnd-001", supported=["gpt-oss-20b"])
+
+    pool = EnginePool(max_model_memory=None)
+    pool._entries.update(discover_models(models_root))
+    discover_adapters(adapter_root, pool._entries)  # type: ignore[arg-type]
+    assert len(pool._entries["gpt-oss-20b"].available_adapters) == 1
+
+    # Delete the sidecar → adapter becomes undiscoverable
+    (adapter_dir / "omlx.json").unlink()
+
+    result = await pool.rescan_adapters()
+    assert result["attached"] == 0
+    assert result["removed"] == 1
+    assert result["total"] == 0
+    assert pool._entries["gpt-oss-20b"].available_adapters == []

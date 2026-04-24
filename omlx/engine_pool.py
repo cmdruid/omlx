@@ -992,6 +992,56 @@ class EnginePool:
             ],
         }
 
+    async def rescan_adapters(self) -> dict:
+        """Re-walk ~/.omlx/adapters/ and refresh each base's available_adapters.
+
+        Picks up adapters added/removed since server startup. Holds the pool lock
+        for the duration to serialize against loads/unloads — rescan is O(adapter-count)
+        filesystem reads, so the pause is brief.
+
+        v1 constraint: always scans Path.home() / ".omlx" / "adapters". Multi-root
+        support (deriving adapter dirs from configured model_dirs) can be added later
+        if needed; the settings manager does not store model_dirs at runtime, so there
+        is no clean way to derive them here without a larger refactor.
+
+        Returns:
+            {"attached": <int>, "removed": <int>, "total": <int>}
+        """
+        from .model_discovery import discover_adapters
+
+        async with self._lock:
+            # Snapshot pre-state per model so we can compute the diff.
+            before: dict[str, set[str]] = {
+                mid: {a.adapter_id for a in e.available_adapters}
+                for mid, e in self._entries.items()
+            }
+            # Zero out each entry's adapter list — discover_adapters only appends.
+            for e in self._entries.values():
+                e.available_adapters.clear()
+
+            # Scan the default adapter root under the user's home dir.
+            adapter_root = Path.home() / ".omlx" / "adapters"
+            if adapter_root.exists():
+                # _try_attach_adapter accesses .available_adapters on values,
+                # which EngineEntry provides — structurally compatible with
+                # the DiscoveredModel type annotation in discover_adapters.
+                discover_adapters(adapter_root, self._entries)  # type: ignore[arg-type]
+
+            # Compute diff counts.
+            after: dict[str, set[str]] = {
+                mid: {a.adapter_id for a in e.available_adapters}
+                for mid, e in self._entries.items()
+            }
+            attached = sum(len(after[m] - before.get(m, set())) for m in after)
+            removed = sum(len(before.get(m, set()) - after[m]) for m in after)
+            total = sum(len(s) for s in after.values())
+
+            logger.info(
+                f"Adapter rescan complete: {attached} attached, {removed} removed, "
+                f"{total} total across {len(self._entries)} models"
+            )
+            return {"attached": attached, "removed": removed, "total": total}
+
     async def check_ttl_expirations(
         self,
         settings_manager: ModelSettingsManager,

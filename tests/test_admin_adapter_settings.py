@@ -264,3 +264,38 @@ async def test_unrelated_field_change_does_not_unload(mocked_admin):
         is_admin=True,
     )
     pool._unload_engine.assert_not_called()
+
+
+# =============================================================================
+# Item 5: runtime rescan endpoint — admin-level tests
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_rescan_route_returns_summary(mocked_admin):
+    pool, _ = mocked_admin
+    pool.rescan_adapters = AsyncMock(return_value={"attached": 1, "removed": 0, "total": 1})
+    response = await admin_routes.rescan_adapters_route(is_admin=True)
+    assert response == {"attached": 1, "removed": 0, "total": 1}
+    pool.rescan_adapters.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_rescan_route_503_when_no_pool():
+    pool_original = admin_routes._get_engine_pool
+    admin_routes._get_engine_pool = lambda: None
+    try:
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException) as exc:
+            await admin_routes.rescan_adapters_route(is_admin=True)
+        assert exc.value.status_code == 503
+    finally:
+        admin_routes._get_engine_pool = pool_original
+
+
+def test_rescan_route_requires_admin():
+    from inspect import signature
+    sig = signature(admin_routes.rescan_adapters_route)
+    is_admin_param = sig.parameters.get("is_admin")
+    assert is_admin_param is not None
+    assert "require_admin" in repr(is_admin_param.default)
