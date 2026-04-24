@@ -287,6 +287,29 @@ class EnginePool:
             f"max memory: {mem_display}"
         )
 
+        self._warn_stale_adapter_ids()
+
+    def _warn_stale_adapter_ids(self) -> None:
+        """Log a WARNING for each model whose settings.adapter_id doesn't match
+        any of its available_adapters. Non-destructive — just logs."""
+        if self._settings_manager is None:
+            return
+        for model_id, entry in self._entries.items():
+            try:
+                settings = self._settings_manager.get_settings(model_id)
+            except Exception:
+                continue  # settings read is best-effort; don't crash discovery
+            configured = getattr(settings, "adapter_id", None)
+            if not configured:
+                continue
+            available_ids = {a.adapter_id for a in entry.available_adapters}
+            if configured not in available_ids:
+                logger.warning(
+                    f"Model {model_id}: settings.adapter_id={configured!r} does "
+                    f"not match any available adapter ({sorted(available_ids) or 'none'}). "
+                    f"Setting will be ignored at load; clear or update via the admin UI."
+                )
+
     _MODEL_TYPE_TO_ENGINE: dict[str, str] = {
         "llm": "batched",
         "vlm": "vlm",

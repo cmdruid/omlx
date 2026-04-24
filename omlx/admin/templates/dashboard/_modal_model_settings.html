@@ -564,6 +564,12 @@
                                         <div class="flex-1 min-w-0">
                                             <span>Selected adapter "<span x-text="modelSettings.adapter_id" class="font-medium"></span>" is no longer available. Pick a new one or choose "None (base only)".</span>
                                         </div>
+                                        <button
+                                            type="button"
+                                            @click="modelSettings.adapter_id = ''"
+                                            class="flex-shrink-0 px-2 py-0.5 text-xs font-medium text-amber-700 bg-amber-100 hover:bg-amber-200 border border-amber-300 rounded transition-colors">
+                                            Clear
+                                        </button>
                                     </div>
                                 </div>
                             </template>

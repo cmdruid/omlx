@@ -333,3 +333,103 @@ async def test_rescan_removes_adapter_when_sidecar_deleted(tmp_path, monkeypatch
     assert result["removed"] == 1
     assert result["total"] == 0
     assert pool._entries["gpt-oss-20b"].available_adapters == []
+
+
+# ---------------------------------------------------------------------------
+# Item 2: stale adapter_id warning during discover_models
+# ---------------------------------------------------------------------------
+
+def test_discover_models_warns_on_stale_adapter_id(tmp_path, monkeypatch, caplog):
+    """Stale settings.adapter_id logs a prominent WARNING during discovery."""
+    from pathlib import Path
+    from unittest.mock import MagicMock
+    from omlx.engine_pool import EnginePool
+    from omlx.model_settings import ModelSettings
+
+    # Plant a base + one adapter
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    models_root = fake_home / ".omlx" / "models"
+    models_root.mkdir(parents=True)
+    adapter_root = fake_home / ".omlx" / "adapters"
+    adapter_root.mkdir()
+
+    _plant_base(models_root, "gpt-oss-20b")
+    _plant_adapter(adapter_root, "rnd-001", supported=["gpt-oss-20b"])
+
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))
+
+    pool = EnginePool(max_model_memory=None)
+    # Mock settings manager to return a stale adapter_id for the base
+    settings_mgr = MagicMock()
+    settings_mgr.get_settings = MagicMock(return_value=ModelSettings(adapter_id="ghost-adapter"))
+    pool._settings_manager = settings_mgr
+
+    with caplog.at_level("WARNING"):
+        pool.discover_models(str(models_root))
+
+    assert "gpt-oss-20b" in pool._entries
+    # Warning must mention both the bad id and the model
+    relevant = [r for r in caplog.records if "ghost-adapter" in r.message and r.levelname == "WARNING"]
+    assert relevant, f"expected WARNING for stale adapter_id, got: {[r.message for r in caplog.records]}"
+    assert "gpt-oss-20b" in relevant[0].message
+
+
+def test_discover_models_no_warn_when_adapter_id_valid(tmp_path, monkeypatch, caplog):
+    """No stale-id warning when settings.adapter_id matches an available adapter."""
+    from pathlib import Path
+    from unittest.mock import MagicMock
+    from omlx.engine_pool import EnginePool
+    from omlx.model_settings import ModelSettings
+
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    models_root = fake_home / ".omlx" / "models"
+    models_root.mkdir(parents=True)
+    adapter_root = fake_home / ".omlx" / "adapters"
+    adapter_root.mkdir()
+
+    _plant_base(models_root, "gpt-oss-20b")
+    _plant_adapter(adapter_root, "rnd-001", supported=["gpt-oss-20b"])
+
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))
+
+    pool = EnginePool(max_model_memory=None)
+    settings_mgr = MagicMock()
+    settings_mgr.get_settings = MagicMock(return_value=ModelSettings(adapter_id="rnd-001"))
+    pool._settings_manager = settings_mgr
+
+    with caplog.at_level("WARNING"):
+        pool.discover_models(str(models_root))
+
+    # No warnings about stale adapter_id
+    stale_warnings = [r for r in caplog.records if "does not match any available" in r.message]
+    assert not stale_warnings
+
+
+def test_discover_models_no_warn_when_adapter_id_none(tmp_path, monkeypatch, caplog):
+    """No warning when adapter_id is None (no adapter selected)."""
+    from pathlib import Path
+    from unittest.mock import MagicMock
+    from omlx.engine_pool import EnginePool
+    from omlx.model_settings import ModelSettings
+
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    models_root = fake_home / ".omlx" / "models"
+    models_root.mkdir(parents=True)
+
+    _plant_base(models_root, "base")
+
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))
+
+    pool = EnginePool(max_model_memory=None)
+    settings_mgr = MagicMock()
+    settings_mgr.get_settings = MagicMock(return_value=ModelSettings())  # adapter_id=None
+    pool._settings_manager = settings_mgr
+
+    with caplog.at_level("WARNING"):
+        pool.discover_models(str(models_root))
+
+    stale_warnings = [r for r in caplog.records if "does not match any available" in r.message]
+    assert not stale_warnings
