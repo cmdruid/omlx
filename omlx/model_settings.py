@@ -48,6 +48,9 @@ class ModelSettings:
         ttl_seconds: Auto-unload after idle seconds (None = no TTL).
         model_type_override: "llm", "vlm", "embedding", "reranker", or None (auto-detect).
         model_alias: API-visible alternative to the directory name.
+        adapter_id: LoRA adapter directory name to load with this model (None = no adapter).
+            Must match one of the base's available_adapters.adapter_id at load time
+            (validated then; silently warns + loads base-only if unknown).
         index_cache_freq: IndexCache: every Nth layer keeps indexer (DSA models only).
         enable_thinking: Explicit toggle for thinking/reasoning mode (None = auto).
         thinking_budget_enabled: Whether a thinking token budget is active.
@@ -86,6 +89,7 @@ class ModelSettings:
     ttl_seconds: Optional[int] = None  # Auto-unload after idle seconds (None = no TTL)
     model_type_override: Optional[str] = None  # "llm", "vlm", "embedding", "reranker", or None (auto-detect)
     model_alias: Optional[str] = None  # API-visible name (alternative to directory name)
+    adapter_id: Optional[str] = None  # LoRA adapter directory name to load with this model (None = no adapter)
     index_cache_freq: Optional[int] = None  # IndexCache: every Nth layer keeps indexer (DSA models only)
     enable_thinking: Optional[bool] = None  # Explicit toggle for thinking/reasoning mode (None = auto)
     preserve_thinking: Optional[bool] = None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)

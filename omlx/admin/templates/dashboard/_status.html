@@ -135,6 +135,11 @@
                                             <span x-show="!m.pinned" class="w-3 flex-shrink-0"></span>
                                             <!-- Model name -->
                                             <span class="text-sm font-medium text-neutral-800" x-text="m.id"></span>
+                                            <!-- Attached adapter badge -->
+                                            <span x-show="m.loaded_adapter_id"
+                                                  x-cloak
+                                                  class="text-xs text-neutral-400 font-normal"
+                                                  x-text="'(+ ' + m.loaded_adapter_id + ')'"></span>
                                         </div>
                                         <div class="flex items-center gap-3">
                                             <!-- Status indicator -->

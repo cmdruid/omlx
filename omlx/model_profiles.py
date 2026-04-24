@@ -59,6 +59,7 @@ EXCLUDED_FROM_PROFILES = frozenset({
     "description",
     "model_alias",
     "model_type_override",
+    "adapter_id",
     "active_profile_name",
     "ttl_seconds",
 })

@@ -92,6 +92,7 @@
             // Model settings modal
             showModelSettingsModal: false,
             selectedModel: null,
+            initialAdapterId: null,
             modelSettings: {
                 model_alias: '',
                 model_type_override: '',
@@ -1549,8 +1550,10 @@
                     dflash_enabled: settings.dflash_enabled || false,
                     dflash_draft_model: settings.dflash_draft_model || '',
                     dflash_draft_quant_bits: settings.dflash_draft_quant_bits ? String(settings.dflash_draft_quant_bits) : '',
+                    adapter_id: settings.adapter_id || '',
                     ctKwargEntries,
                 };
+                this.initialAdapterId = settings.adapter_id || '';
                 this.showModelSettingsModal = true;
             },
 
@@ -1629,6 +1632,7 @@
                                 dflash_draft_quant_bits: this.modelSettings.dflash_enabled && this.modelSettings.dflash_draft_quant_bits
                                     ? parseInt(this.modelSettings.dflash_draft_quant_bits)
                                     : null,
+                                adapter_id: this.modelSettings.adapter_id || null,
                             };
                         })()),
                     });

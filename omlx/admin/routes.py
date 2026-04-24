@@ -97,6 +97,7 @@ class ModelSettingsRequest(BaseModel):
 
     model_alias: Optional[str] = None
     model_type_override: Optional[str] = None
+    adapter_id: Optional[str] = None
     max_context_window: Optional[int] = None
     max_tokens: Optional[int] = None
     temperature: Optional[float] = None
@@ -1394,6 +1395,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "thinking_default": model_info.get("thinking_default"),
             "preserve_thinking_default": model_info.get("preserve_thinking_default"),
             "last_access": model_info.get("last_access"),
+            "available_adapters": model_info.get("available_adapters", []),
+            "loaded_adapter_id": model_info.get("loaded_adapter_id"),
         }
 
         # Add settings if available
@@ -1433,6 +1436,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
                 "display_name": settings.display_name,
                 "description": settings.description,
                 "active_profile_name": settings.active_profile_name,
+                "adapter_id": settings.adapter_id,
             }
 
         models.append(model_data)
@@ -1534,6 +1538,9 @@ async def update_model_settings(
     # Get current settings
     from ..model_settings import ModelSettings
     current_settings = settings_manager.get_settings(model_id)
+
+    # B7: capture old adapter_id before any mutation so we can compare later
+    old_adapter_id = current_settings.adapter_id
 
     # Apply updates — use model_fields_set to distinguish "sent as null"
     # (clear to default) from "not sent" (don't touch).
@@ -1656,6 +1663,20 @@ async def update_model_settings(
     if "dflash_draft_quant_bits" in sent:
         current_settings.dflash_draft_quant_bits = request.dflash_draft_quant_bits or None
 
+    if "adapter_id" in sent:
+        requested_adapter_id = request.adapter_id or None
+        if requested_adapter_id is not None:
+            valid_ids = [a.adapter_id for a in entry.available_adapters]
+            if requested_adapter_id not in valid_ids:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Invalid adapter_id {requested_adapter_id!r} for model "
+                        f"{model_id!r}. Valid adapter_ids: "
+                        f"{valid_ids if valid_ids else '(none available for this model)'}"
+                    ),
+                )
+        current_settings.adapter_id = requested_adapter_id
     if "reasoning_parser" in sent:
         current_settings.reasoning_parser = request.reasoning_parser or None
     if request.is_pinned is not None:
@@ -1729,6 +1750,17 @@ async def update_model_settings(
             f"Settings changed for loaded model {model_id}. "
             f"Reload required to take effect."
         )
+
+    # B7: auto-invalidate engine if adapter_id changed on a loaded model
+    if "adapter_id" in sent:
+        new_adapter_id = current_settings.adapter_id
+        if new_adapter_id != old_adapter_id and entry.engine is not None:
+            logger.info(
+                f"Model {model_id}: adapter_id changed "
+                f"{old_adapter_id!r} → {new_adapter_id!r}; unloading engine "
+                f"so next request reloads with new adapter"
+            )
+            await engine_pool._unload_engine(model_id)
 
     return {
         "success": True,
@@ -3224,6 +3256,7 @@ def _build_active_models_data() -> dict:
             "waiting_requests": waiting_requests,
             "prefilling": prefilling,
             "generating": generating,
+            "loaded_adapter_id": model_info.get("loaded_adapter_id"),
         })
 
         total_active += active_requests
