@@ -165,6 +165,7 @@ from .exceptions import (
     ModelNotFoundError,
     ModelTooLargeError,
 )
+from .logging_config import set_request_id
 from .model_discovery import format_size
 from .server_metrics import get_server_metrics, reset_server_metrics
 
@@ -1924,6 +1925,10 @@ async def create_chat_completion(
     }
     ```
     """
+    # Generate the chat completion id once and stamp it into the log context.
+    response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
+    set_request_id(response_id)
+
     # Log incoming request summary at debug, message content at trace
     logger.debug(f"Chat completion request received: model={request.model}, "
                  f"messages={len(request.messages)}, stream={request.stream}, "
@@ -2136,7 +2141,7 @@ async def create_chat_completion(
     if request.stream:
         return StreamingResponse(
             _with_sse_keepalive(
-                stream_chat_completion(engine, messages, request, model_load_duration=model_load_duration, resolved_model=resolved_model, **chat_kwargs),
+                stream_chat_completion(engine, messages, request, response_id=response_id, model_load_duration=model_load_duration, resolved_model=resolved_model, **chat_kwargs),
                 http_request=http_request,
             ),
             media_type="text/event-stream",
@@ -2218,6 +2223,7 @@ async def create_chat_completion(
         finish_reason = "tool_calls" if tool_calls else output.finish_reason
 
         return ChatCompletionResponse(
+            id=response_id,
             model=request.model,
             choices=[ChatCompletionChoice(
                 message=AssistantMessage(
@@ -2583,6 +2589,8 @@ async def stream_chat_completion(
     engine: BaseEngine,
     messages: list,
     request: ChatCompletionRequest,
+    *,
+    response_id: str,
     model_load_duration: float = 0.0,
     resolved_model: Optional[str] = None,
     **kwargs,
@@ -2592,6 +2600,10 @@ async def stream_chat_completion(
     Streams content tokens with reasoning/thinking separation, then at
     completion parses tool calls from accumulated text and emits them
     as structured tool_calls chunks (OpenAI streaming format).
+
+    ``response_id`` is supplied by the route handler (create_chat_completion)
+    so it matches the request_id stamped into the log context via
+    set_request_id().  Do not regenerate it here.
     """
     start_time = time.perf_counter()
     first_token_time = None
@@ -2599,8 +2611,6 @@ async def stream_chat_completion(
     accumulated_text = ""
     has_tools = bool(kwargs.get("tools"))
     thinking_parser = ThinkingParser()
-
-    response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
     # First chunk with role
     first_chunk = ChatCompletionChunk(
