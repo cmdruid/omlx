@@ -514,7 +514,7 @@ class TestStreamingHelperFunctions:
         events = []
         messages = [{"role": "user", "content": "Hi"}]
         async for event in stream_chat_completion(
-            engine, messages, request, max_tokens=256, temperature=0.7, top_p=0.9, top_k=40
+            engine, messages, request, response_id="chatcmpl-test", max_tokens=256, temperature=0.7, top_p=0.9, top_k=40
         ):
             events.append(event)
 
@@ -537,7 +537,7 @@ class TestStreamingHelperFunctions:
         first_event = None
         messages = [{"role": "user", "content": "Hello"}]
         async for event in stream_chat_completion(
-            engine, messages, request, max_tokens=256, temperature=0.7, top_p=0.9, top_k=40
+            engine, messages, request, response_id="chatcmpl-test", max_tokens=256, temperature=0.7, top_p=0.9, top_k=40
         ):
             if event != "data: [DONE]\n\n":
                 first_event = event
@@ -597,6 +597,7 @@ class TestStreamingHelperFunctions:
             engine,
             messages,
             request,
+            response_id="chatcmpl-test",
             max_tokens=256,
             temperature=0.7,
             top_p=0.9,
@@ -678,6 +679,7 @@ class TestStreamingHelperFunctions:
             engine,
             messages,
             request,
+            response_id="chatcmpl-test",
             max_tokens=256,
             temperature=0.7,
             top_p=0.9,
@@ -787,6 +789,7 @@ class TestStreamingHelperFunctions:
             engine,
             messages,
             request,
+            response_id="chatcmpl-test",
             max_tokens=256,
             temperature=0.7,
             top_p=0.9,
@@ -992,6 +995,7 @@ class TestStreamingHelperFunctions:
             engine,
             messages,
             request,
+            response_id="chatcmpl-test",
             max_tokens=256,
             temperature=0.7,
             top_p=0.9,
@@ -1087,6 +1091,7 @@ class TestStreamingHelperFunctions:
             engine,
             messages,
             request,
+            response_id="chatcmpl-test",
             max_tokens=256,
             temperature=0.7,
             top_p=0.9,
@@ -1206,6 +1211,7 @@ class TestStreamingHelperFunctions:
             engine,
             messages,
             request,
+            response_id="chatcmpl-test",
             max_tokens=256,
             temperature=0.7,
             top_p=0.9,
@@ -1324,6 +1330,7 @@ class TestStreamingHelperFunctions:
             engine,
             messages,
             request,
+            response_id="chatcmpl-test",
             max_tokens=256,
             temperature=0.7,
             top_p=0.9,
@@ -1452,6 +1459,7 @@ class TestStreamingHelperFunctions:
             engine,
             messages,
             request,
+            response_id="chatcmpl-test",
             max_tokens=256,
             temperature=0.7,
             top_p=0.9,
@@ -1546,6 +1554,7 @@ class TestStreamingHelperFunctions:
             engine,
             messages,
             request,
+            response_id="chatcmpl-test",
             max_tokens=256,
             temperature=0.7,
             top_p=0.9,
@@ -1636,6 +1645,7 @@ class TestStreamingHelperFunctions:
             engine,
             messages,
             request,
+            response_id="chatcmpl-test",
             max_tokens=256,
             temperature=0.7,
             top_p=0.9,
@@ -1728,6 +1738,7 @@ class TestStreamingHelperFunctions:
             engine,
             messages,
             request,
+            response_id="chatcmpl-test",
             max_tokens=256,
             temperature=0.7,
             top_p=0.9,
@@ -1824,6 +1835,7 @@ class TestStreamingHelperFunctions:
             engine,
             messages,
             request,
+            response_id="chatcmpl-test",
             max_tokens=256,
             temperature=0.7,
             top_p=0.9,
@@ -1919,6 +1931,7 @@ class TestStreamingHelperFunctions:
             engine,
             messages,
             request,
+            response_id="chatcmpl-test",
             max_tokens=256,
             temperature=0.7,
             top_p=0.9,
@@ -2019,6 +2032,7 @@ class TestStreamingHelperFunctions:
             engine,
             messages,
             request,
+            response_id="chatcmpl-test",
             max_tokens=256,
             temperature=0.7,
             top_p=0.9,
@@ -2103,6 +2117,7 @@ class TestStreamingHelperFunctions:
             engine,
             messages,
             request,
+            response_id="chatcmpl-test",
             max_tokens=256,
             temperature=0.7,
             top_p=0.9,
@@ -2189,6 +2204,7 @@ class TestStreamingHelperFunctions:
             engine,
             messages,
             request,
+            response_id="chatcmpl-test",
             max_tokens=256,
             temperature=0.7,
             top_p=0.9,
@@ -2278,6 +2294,7 @@ class TestStreamingHelperFunctions:
             engine,
             messages,
             request,
+            response_id="chatcmpl-test",
             max_tokens=256,
             temperature=0.7,
             top_p=0.9,
@@ -2376,6 +2393,7 @@ class TestStreamingHelperFunctions:
             engine,
             messages,
             request,
+            response_id="chatcmpl-test",
             max_tokens=256,
             temperature=0.7,
             top_p=0.9,
@@ -2461,6 +2479,7 @@ class TestStreamingHelperFunctions:
             engine,
             messages,
             request,
+            response_id="chatcmpl-test",
             max_tokens=256,
             temperature=0.7,
             top_p=0.9,
@@ -2542,6 +2561,7 @@ class TestStreamingHelperFunctions:
             engine,
             messages,
             request,
+            response_id="chatcmpl-test",
             max_tokens=256,
             temperature=0.7,
             top_p=0.9,

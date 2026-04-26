@@ -2172,18 +2172,21 @@ async def create_chat_completion(
             model_id=resolved_model,
         )
         # Emit per-request trace record (best-effort).
-        _sink = get_trace_sink()
-        if _sink is not None:
-            _entry = get_engine_pool().get_entry(resolved_model)
-            _adapter_id = _loaded_adapter_id(_entry) if _entry is not None else None
-            _sink.write(build_chat_trace_record(
-                request_id=response_id,
-                model_id=resolved_model,
-                adapter_id=_adapter_id,
-                prompt_tokens=output.prompt_tokens,
-                completion_tokens=output.completion_tokens,
-                elapsed_seconds=elapsed,
-            ))
+        try:
+            _sink = get_trace_sink()
+            if _sink is not None:
+                _entry = get_engine_pool().get_entry(resolved_model)
+                _adapter_id = _loaded_adapter_id(_entry) if _entry is not None else None
+                _sink.write(build_chat_trace_record(
+                    request_id=response_id,
+                    model_id=resolved_model,
+                    adapter_id=_adapter_id,
+                    prompt_tokens=output.prompt_tokens,
+                    completion_tokens=output.completion_tokens,
+                    elapsed_seconds=elapsed,
+                ))
+        except Exception:  # noqa: BLE001
+            logger.warning("trace emit failed", exc_info=True)
 
         # Separate thinking from content
         raw_text = clean_special_tokens(output.text) if output.text else ""
@@ -2886,19 +2889,22 @@ async def stream_chat_completion(
             model_id=resolved_model or request.model,
         )
         # Emit per-request trace record (best-effort).
-        _sink = get_trace_sink()
-        if _sink is not None:
-            _resolved = resolved_model or request.model
-            _entry = get_engine_pool().get_entry(_resolved)
-            _adapter_id = _loaded_adapter_id(_entry) if _entry is not None else None
-            _sink.write(build_chat_trace_record(
-                request_id=response_id,
-                model_id=_resolved,
-                adapter_id=_adapter_id,
-                prompt_tokens=last_output.prompt_tokens,
-                completion_tokens=last_output.completion_tokens,
-                elapsed_seconds=end_time - start_time,
-            ))
+        try:
+            _sink = get_trace_sink()
+            if _sink is not None:
+                _resolved = resolved_model or request.model
+                _entry = get_engine_pool().get_entry(_resolved)
+                _adapter_id = _loaded_adapter_id(_entry) if _entry is not None else None
+                _sink.write(build_chat_trace_record(
+                    request_id=response_id,
+                    model_id=_resolved,
+                    adapter_id=_adapter_id,
+                    prompt_tokens=last_output.prompt_tokens,
+                    completion_tokens=last_output.completion_tokens,
+                    elapsed_seconds=end_time - start_time,
+                ))
+        except Exception:  # noqa: BLE001
+            logger.warning("trace emit failed", exc_info=True)
 
         # Emit usage chunk if requested
         if request.stream_options and request.stream_options.include_usage:
