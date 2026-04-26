@@ -168,6 +168,7 @@ from .exceptions import (
 from .logging_config import set_request_id
 from .model_discovery import format_size
 from .server_metrics import get_server_metrics, reset_server_metrics
+from .trace_sink import reset_trace_sink, shutdown_trace_sink
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -403,6 +404,8 @@ async def lifespan(app: FastAPI):
     if _server_state.engine_pool is not None:
         await _server_state.engine_pool.shutdown()
         logger.info("Engine pool shutdown")
+    # Close trace sink last so any in-flight teardown logging is captured.
+    shutdown_trace_sink()
 
 
 app = FastAPI(
@@ -1164,6 +1167,9 @@ def init_server(
     # Reset server metrics for fresh start (with all-time persistence)
     stats_path = base_path / "stats.json"
     reset_server_metrics(stats_path=stats_path)
+    # Open per-uptime trace sink for chat-completions auditing.
+    traces_dir = base_path / "traces"
+    reset_trace_sink(traces_dir=traces_dir)
 
     logger.info(f"Server initialized with {_server_state.engine_pool.model_count} models")
     if _server_state.default_model:

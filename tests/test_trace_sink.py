@@ -63,3 +63,36 @@ def test_trace_sink_close_is_idempotent(tmp_path: Path):
     sink = TraceSink(traces_dir=tmp_path)
     sink.close()
     sink.close()  # second close is a no-op
+
+
+def test_reset_trace_sink_replaces_singleton(tmp_path: Path):
+    """reset_trace_sink closes any existing sink and opens a fresh one."""
+    from omlx.trace_sink import reset_trace_sink, get_trace_sink, shutdown_trace_sink
+
+    try:
+        reset_trace_sink(traces_dir=tmp_path / "first")
+        first = get_trace_sink()
+        assert first is not None
+        first_path = first.path
+
+        reset_trace_sink(traces_dir=tmp_path / "second")
+        second = get_trace_sink()
+        assert second is not None
+        assert second.path != first_path
+        # First sink should be closed.
+        assert first._closed
+    finally:
+        shutdown_trace_sink()
+
+
+def test_reset_trace_sink_with_none_disables_singleton(tmp_path: Path):
+    """Passing None to reset_trace_sink leaves the singleton as None."""
+    from omlx.trace_sink import reset_trace_sink, get_trace_sink, shutdown_trace_sink
+
+    try:
+        reset_trace_sink(traces_dir=tmp_path)
+        assert get_trace_sink() is not None
+        reset_trace_sink(traces_dir=None)
+        assert get_trace_sink() is None
+    finally:
+        shutdown_trace_sink()
