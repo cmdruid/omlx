@@ -1440,6 +1440,7 @@ async def health():
 
     return {
         "status": "healthy",
+        "version": __version__,
         "default_model": _server_state.default_model,
         "engine_pool": pool_status,
         "mcp": mcp_info,
