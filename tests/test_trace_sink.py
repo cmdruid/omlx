@@ -96,3 +96,75 @@ def test_reset_trace_sink_with_none_disables_singleton(tmp_path: Path):
         assert get_trace_sink() is None
     finally:
         shutdown_trace_sink()
+
+
+def test_chat_completion_emits_trace_record(tmp_path: Path, monkeypatch):
+    """A successful chat-completion writes one JSONL trace record with the right shape."""
+    from datetime import datetime
+    from unittest.mock import MagicMock, AsyncMock
+
+    from omlx.trace_sink import reset_trace_sink, get_trace_sink, shutdown_trace_sink
+    from omlx.server import app, _server_state
+    from fastapi.testclient import TestClient
+
+    reset_trace_sink(traces_dir=tmp_path)
+
+    # Mock the engine to return a fixed response without loading a real model.
+    fake_tokenizer = MagicMock()
+    fake_tokenizer.has_tool_calling = False
+
+    fake_engine = MagicMock()
+    fake_engine.model_type = "llama"
+    fake_engine.tokenizer = fake_tokenizer
+    fake_engine.message_extractor = None
+    fake_engine.count_chat_tokens = MagicMock(return_value=10)
+    fake_output = MagicMock()
+    fake_output.text = "hi"
+    fake_output.tool_calls = None
+    fake_output.prompt_tokens = 10
+    fake_output.completion_tokens = 5
+    fake_output.cached_tokens = 0
+    fake_output.finish_reason = "stop"
+    fake_engine.chat = AsyncMock(return_value=fake_output)
+
+    async def _fake_get_engine(_model):
+        return fake_engine
+
+    monkeypatch.setattr("omlx.server.get_engine_for_model", _fake_get_engine)
+    monkeypatch.setattr("omlx.server.resolve_model_id", lambda m: m)
+    monkeypatch.setattr("omlx.server.validate_context_window", lambda *a, **kw: None)
+    monkeypatch.setattr("omlx.server.get_engine_pool", lambda: MagicMock(get_entry=lambda _: None))
+
+    original_key = _server_state.api_key
+    _server_state.api_key = None
+    try:
+        with TestClient(app, raise_server_exceptions=False) as client:
+            resp = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": False,
+                },
+            )
+        assert resp.status_code == 200
+        body = resp.json()
+        response_id = body["id"]
+    finally:
+        _server_state.api_key = original_key
+        shutdown_trace_sink()
+
+    # Find the JSONL file and verify the trace record.
+    files = list(tmp_path.glob("*.jsonl"))
+    assert len(files) == 1
+    lines = files[0].read_text().splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["request_id"] == response_id
+    assert record["model_id"] == "test-model"
+    assert "adapter_id" in record  # may be empty string
+    assert "version" in record
+    assert record["prompt_tokens"] == 10
+    assert record["completion_tokens"] == 5
+    assert "elapsed_seconds" in record
+    assert "timestamp" in record

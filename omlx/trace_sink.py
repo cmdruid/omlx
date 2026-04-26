@@ -107,3 +107,32 @@ def shutdown_trace_sink() -> None:
     if _trace_sink is not None:
         _trace_sink.close()
         _trace_sink = None
+
+
+def build_chat_trace_record(
+    *,
+    request_id: str,
+    model_id: str,
+    adapter_id: Optional[str],
+    prompt_tokens: int,
+    completion_tokens: int,
+    elapsed_seconds: float,
+) -> dict[str, Any]:
+    """Build a chat-completion trace record. Centralizes shape so both the
+    streaming and non-streaming paths produce identical records."""
+    from ._version import __version__
+
+    timestamp = datetime.now(tz=timezone.utc).isoformat(timespec="milliseconds")
+    # ISO 8601 with 'Z' suffix for UTC clarity (Python uses '+00:00' otherwise).
+    if timestamp.endswith("+00:00"):
+        timestamp = timestamp[:-6] + "Z"
+    return {
+        "request_id": request_id,
+        "timestamp": timestamp,
+        "model_id": model_id,
+        "adapter_id": adapter_id or "",
+        "version": __version__,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "elapsed_seconds": round(elapsed_seconds, 3),
+    }

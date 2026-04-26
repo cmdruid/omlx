@@ -157,7 +157,7 @@ from .api.utils import clean_output_text, clean_special_tokens, extract_multimod
 from .engine import BaseEngine, BatchedEngine, VLMBatchedEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
-from .engine_pool import EnginePool
+from .engine_pool import EnginePool, _loaded_adapter_id
 from .exceptions import (
     EnginePoolError,
     InsufficientMemoryError,
@@ -168,7 +168,7 @@ from .exceptions import (
 from .logging_config import set_request_id
 from .model_discovery import format_size
 from .server_metrics import get_server_metrics, reset_server_metrics
-from .trace_sink import reset_trace_sink, shutdown_trace_sink
+from .trace_sink import build_chat_trace_record, get_trace_sink, reset_trace_sink, shutdown_trace_sink
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -2171,6 +2171,19 @@ async def create_chat_completion(
             generation_duration=elapsed,
             model_id=resolved_model,
         )
+        # Emit per-request trace record (best-effort).
+        _sink = get_trace_sink()
+        if _sink is not None:
+            _entry = get_engine_pool().get_entry(resolved_model)
+            _adapter_id = _loaded_adapter_id(_entry) if _entry is not None else None
+            _sink.write(build_chat_trace_record(
+                request_id=response_id,
+                model_id=resolved_model,
+                adapter_id=_adapter_id,
+                prompt_tokens=output.prompt_tokens,
+                completion_tokens=output.completion_tokens,
+                elapsed_seconds=elapsed,
+            ))
 
         # Separate thinking from content
         raw_text = clean_special_tokens(output.text) if output.text else ""
@@ -2872,6 +2885,20 @@ async def stream_chat_completion(
             generation_duration=gen_duration,
             model_id=resolved_model or request.model,
         )
+        # Emit per-request trace record (best-effort).
+        _sink = get_trace_sink()
+        if _sink is not None:
+            _resolved = resolved_model or request.model
+            _entry = get_engine_pool().get_entry(_resolved)
+            _adapter_id = _loaded_adapter_id(_entry) if _entry is not None else None
+            _sink.write(build_chat_trace_record(
+                request_id=response_id,
+                model_id=_resolved,
+                adapter_id=_adapter_id,
+                prompt_tokens=last_output.prompt_tokens,
+                completion_tokens=last_output.completion_tokens,
+                elapsed_seconds=end_time - start_time,
+            ))
 
         # Emit usage chunk if requested
         if request.stream_options and request.stream_options.include_usage:
