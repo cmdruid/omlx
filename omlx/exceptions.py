@@ -399,6 +399,21 @@ class ModelLoadingError(EnginePoolError):
         super().__init__(f"Model '{model_id}' is already being loaded")
 
 
+class AdapterSwapError(EnginePoolError):
+    """Raised when EnginePool.swap_adapter cannot complete the swap.
+
+    Attributes:
+        error_type: Machine-readable category (``model_not_found``,
+            ``adapter_not_found``, ``adapter_load_failed``).
+        message: Human-readable description (also accessible via
+            ``OMLXError.message`` from the parent).
+    """
+
+    def __init__(self, error_type: str, message: str):
+        self.error_type = error_type
+        super().__init__(message)
+
+
 # =============================================================================
 # MCP Errors
 # =============================================================================

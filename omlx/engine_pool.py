@@ -34,6 +34,7 @@ from .engine.sts import STSEngine
 from .engine.tts import TTSEngine
 from .engine.vlm import VLMBatchedEngine
 from .exceptions import (
+    AdapterSwapError,
     EnginePoolError,
     InsufficientMemoryError,
     ModelLoadingError,
@@ -46,6 +47,8 @@ from .engine_core import get_mlx_executor
 from .scheduler import SchedulerConfig
 
 logger = logging.getLogger(__name__)
+
+
 
 
 @dataclass
@@ -67,6 +70,7 @@ class EngineEntry:
     abort_loading: bool = False  # Set by memory enforcer to abort in-progress load
     available_adapters: list[AdapterInfo] = field(default_factory=list)  # LoRA adapters for this base model
     _adapter_size_bump: int = 0  # Bytes added to estimated_size for the currently-tracked adapter
+    swap_lock: asyncio.Lock = field(default_factory=asyncio.Lock)  # Per-engine lock for adapter swaps
 
 
 def _loaded_adapter_id(entry: "EngineEntry") -> Optional[str]:
@@ -978,6 +982,60 @@ class EnginePool:
         finally:
             entry.is_loading = False
             entry.abort_loading = False
+
+    async def swap_adapter(
+        self, model_id: str, adapter_id: Optional[str]
+    ) -> None:
+        """Atomically swap the engine's loaded adapter.
+
+        - ``adapter_id=None`` detaches the current adapter (engine reloads
+          without one).
+        - Otherwise, ``adapter_id`` must match an entry in ``available_adapters``.
+
+        Holds the per-engine ``swap_lock`` for the unload+load cycle so
+        concurrent chat-completion requests on the same engine queue
+        cleanly. Raises ``AdapterSwapError`` on validation failure or load
+        failure; the caller is responsible for reverting any settings
+        changes.
+
+        Args:
+            model_id: Target model id.
+            adapter_id: Adapter id to load, or None to detach.
+
+        Raises:
+            AdapterSwapError(error_type='model_not_found'): no such model.
+            AdapterSwapError(error_type='adapter_not_found'): adapter_id not in
+                available_adapters.
+            AdapterSwapError(error_type='adapter_load_failed'): load attempt failed.
+        """
+        entry = self._entries.get(model_id)
+        if entry is None:
+            raise AdapterSwapError(
+                "model_not_found", f"Model not found: {model_id}"
+            )
+
+        if adapter_id is not None:
+            ids = {a.adapter_id for a in entry.available_adapters}
+            if adapter_id not in ids:
+                raise AdapterSwapError(
+                    "adapter_not_found",
+                    f"Adapter {adapter_id!r} not in available_adapters {sorted(ids)!r}",
+                )
+
+        async with entry.swap_lock:
+            # Apply settings.adapter_id so _load_engine picks up the right adapter.
+            if self._settings_manager is not None:
+                ms = self._settings_manager.get_settings(model_id)
+                ms.adapter_id = adapter_id
+                self._settings_manager.set_settings(model_id, ms)
+
+            # Unload current engine if loaded, then load with the new adapter.
+            if entry.engine is not None:
+                await self._unload_engine(model_id)
+            try:
+                await self._load_engine(model_id)
+            except Exception as exc:  # noqa: BLE001
+                raise AdapterSwapError("adapter_load_failed", str(exc)) from exc
 
     async def preload_pinned_models(self) -> None:
         """
