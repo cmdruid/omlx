@@ -256,6 +256,13 @@ class ChatCompletionRequest(BaseModel):
     specprefill_threshold: Optional[int] = None
     # Seed for reproducible generation (best-effort)
     seed: Optional[int] = None
+    # Per-request LoRA adapter override. Field semantics (per design doc):
+    # - Absent: use settings.adapter_id (engine default).
+    # - Explicit null: use base, ignoring settings.adapter_id.
+    # - String: use that adapter; must be in available_adapters.
+    # Distinguish absent vs. null at runtime via:
+    #   "adapter_id" in request.model_fields_set
+    adapter_id: Optional[str] = None
 
     @field_validator("stop", mode="before")
     @classmethod
