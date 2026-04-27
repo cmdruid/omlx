@@ -1037,6 +1037,63 @@ class EnginePool:
             except Exception as exc:  # noqa: BLE001
                 raise AdapterSwapError("adapter_load_failed", str(exc)) from exc
 
+    async def swap_adapter_for_request(
+        self, model_id: str, adapter_id: Optional[str]
+    ) -> None:
+        """Swap the engine to ``adapter_id`` without mutating settings.adapter_id.
+
+        Used by the per-request override path. The caller MUST already hold
+        ``entry.swap_lock`` (we don't re-acquire it here; that would deadlock).
+
+        Temporarily overrides the in-memory adapter_id inside the settings
+        manager (bypassing ``set_settings`` so nothing is persisted to disk),
+        reloads the engine, then restores the original adapter_id in a
+        ``finally`` block so the restore is guaranteed even on failure.
+
+        On failure, raises ``AdapterSwapError(error_type='adapter_load_failed')``.
+        Caller wraps as needed. Raises ``RuntimeError`` if no settings_manager
+        is configured.
+        """
+        entry = self._entries.get(model_id)
+        if entry is None:
+            raise AdapterSwapError(
+                "model_not_found", f"Model not found: {model_id}"
+            )
+
+        if self._settings_manager is None:
+            raise RuntimeError(
+                "swap_adapter_for_request requires a settings_manager"
+            )
+
+        # Access the live settings object directly (not a copy) so we can
+        # restore it without going through set_settings (which persists).
+        # If no entry exists yet in _settings, we create a temporary one so
+        # _load_engine sees the override, then remove it on restore.
+        sm = self._settings_manager
+        _created_entry = False
+        with sm._lock:
+            if model_id not in sm._settings:
+                from .model_settings import ModelSettings
+                sm._settings[model_id] = ModelSettings()
+                _created_entry = True
+            live_settings = sm._settings[model_id]
+            original_adapter_id = live_settings.adapter_id
+            live_settings.adapter_id = adapter_id
+
+        try:
+            if entry.engine is not None:
+                await self._unload_engine(model_id)
+            await self._load_engine(model_id)
+        except Exception as exc:  # noqa: BLE001
+            raise AdapterSwapError("adapter_load_failed", str(exc)) from exc
+        finally:
+            # Restore settings.adapter_id in memory — never persisted.
+            with sm._lock:
+                if _created_entry and model_id in sm._settings:
+                    del sm._settings[model_id]
+                elif model_id in sm._settings:
+                    sm._settings[model_id].adapter_id = original_adapter_id
+
     async def preload_pinned_models(self) -> None:
         """
         Preload all pinned models at startup.

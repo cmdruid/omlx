@@ -160,6 +160,7 @@ from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
 from .engine_pool import EnginePool, _loaded_adapter_id
 from .exceptions import (
+    AdapterSwapError,
     EnginePoolError,
     InsufficientMemoryError,
     ModelLoadingError,
@@ -1962,6 +1963,90 @@ async def create_chat_completion(
     # Resolve alias to real model ID for settings lookups
     resolved_model = resolve_model_id(request.model) or request.model
 
+    # Per-request adapter override (B9).
+    # Field semantics (per B8):
+    #   - Absent (not in model_fields_set): no override; engine stays as-is.
+    #   - Explicit null: swap engine to base (no adapter) for this request.
+    #   - String: swap to that adapter; must be in available_adapters and compatible.
+    pool = get_engine_pool()
+    entry = pool.get_entry(resolved_model)
+    if "adapter_id" in request.model_fields_set and entry is not None:
+        desired = request.adapter_id  # str | None
+
+        if desired is not None:
+            ids = {a.adapter_id for a in entry.available_adapters}
+            if desired not in ids:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": {
+                            "type": "adapter_not_found",
+                            "message": (
+                                f"Adapter {desired!r} not in available_adapters "
+                                f"{sorted(ids)!r} for model {resolved_model!r}"
+                            ),
+                        }
+                    },
+                )
+            # Hard-block on compatible=False.
+            from .adapter_health import get_adapter_health_cache
+            for a in entry.available_adapters:
+                if a.adapter_id == desired:
+                    h = get_adapter_health_cache().get(Path(a.path))
+                    if h is not None and h.compatible is False:
+                        return JSONResponse(
+                            status_code=400,
+                            content={
+                                "error": {
+                                    "type": "adapter_incompatible",
+                                    "message": (
+                                        h.last_load_error
+                                        or "adapter validation reported incompatible"
+                                    ),
+                                }
+                            },
+                        )
+                    break
+
+        # Acquire swap_lock only for the swap itself; release before streaming.
+        async with entry.swap_lock:
+            currently_loaded = (
+                _loaded_adapter_id(entry) if entry.engine is not None else None
+            )
+            if currently_loaded != desired:
+                try:
+                    await pool.swap_adapter_for_request(resolved_model, desired)
+                except AdapterSwapError as exc:
+                    return JSONResponse(
+                        status_code=502 if exc.error_type == "adapter_load_failed" else 400,
+                        content={
+                            "error": {
+                                "type": exc.error_type,
+                                "message": exc.message,
+                            }
+                        },
+                    )
+            # Re-fetch engine reference (may have changed during swap).
+            engine = entry.engine
+
+    return await _run_chat_completion_body(
+        request, http_request, engine, resolved_model, response_id, model_load_duration,
+    )
+
+
+async def _run_chat_completion_body(
+    request: ChatCompletionRequest,
+    http_request: FastAPIRequest,
+    engine: BaseEngine,
+    resolved_model: str,
+    response_id: str,
+    model_load_duration: float,
+):
+    """Run the chat-completion pipeline with a resolved engine + adapter.
+
+    Extracted from create_chat_completion so the route handler can optionally
+    wrap it with a per-request adapter swap (when request.adapter_id is set).
+    """
     # Get per-model settings
     max_tool_result_tokens = None
     merged_ct_kwargs = {}
