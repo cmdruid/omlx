@@ -36,6 +36,7 @@ from .auth import (
     validate_api_key,
     verify_api_key,
 )
+from ..exceptions import AdapterSwapError
 from ..settings import SubKeyEntry
 from ..model_profiles import EXCLUDED_FROM_PROFILES
 
@@ -1511,6 +1512,83 @@ async def rescan_adapters_route(is_admin: bool = Depends(require_admin)):
     if pool is None:
         raise HTTPException(status_code=503, detail="engine pool unavailable")
     return await pool.rescan_adapters()
+
+
+class LoadAdapterRequest(BaseModel):
+    adapter_id: Optional[str] = None
+
+
+@router.post("/api/models/{model_id}/adapter")
+async def load_adapter_route(
+    model_id: str,
+    request: LoadAdapterRequest,
+    is_admin: bool = Depends(require_admin),
+):
+    """Synchronously swap the engine's loaded adapter.
+
+    Differs from PUT /admin/api/models/<id>/settings in that this endpoint
+    waits for the engine reload to complete and returns either success
+    (200, loaded_adapter_id matches request) or a structured error (400/502
+    with type and message; settings reverted to previous on load failure).
+
+    Body: {"adapter_id": "<adapter-id>"} or {"adapter_id": null} to detach.
+
+    Responses:
+        200: {"success": true, "model_id": ..., "settings": {...}, "loaded_adapter_id": ...}
+        400: adapter_not_found (validation failure)
+        404: model not found
+        502: adapter_load_failed (with reverted settings)
+        503: server not initialized
+    """
+    pool = _get_engine_pool()
+    settings_manager = _get_settings_manager()
+    if pool is None or settings_manager is None:
+        raise HTTPException(status_code=503, detail="Server not initialized")
+
+    entry = pool.get_entry(model_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+
+    # Snapshot the previous adapter_id so we can revert on load failure.
+    prev_settings = settings_manager.get_settings(model_id)
+    previous_adapter_id = getattr(prev_settings, "adapter_id", None)
+
+    try:
+        await pool.swap_adapter(model_id, request.adapter_id)
+    except AdapterSwapError as exc:
+        if exc.error_type == "adapter_load_failed":
+            # Revert settings.adapter_id to its prior value.
+            ms = settings_manager.get_settings(model_id)
+            ms.adapter_id = previous_adapter_id
+            settings_manager.set_settings(model_id, ms)
+            return JSONResponse(
+                status_code=502,
+                content={
+                    "success": False,
+                    "model_id": model_id,
+                    "error": {
+                        "type": "adapter_load_failed",
+                        "message": exc.message,
+                    },
+                },
+            )
+        # Validation errors (adapter_not_found, model_not_found from primitive) → 400.
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "model_id": model_id,
+                "error": {"type": exc.error_type, "message": exc.message},
+            },
+        )
+
+    current_settings = settings_manager.get_settings(model_id)
+    return {
+        "success": True,
+        "model_id": model_id,
+        "settings": current_settings.to_dict(),
+        "loaded_adapter_id": request.adapter_id,
+    }
 
 
 @router.put("/api/models/{model_id}/settings")
