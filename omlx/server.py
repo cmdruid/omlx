@@ -2314,6 +2314,11 @@ async def _run_chat_completion_body(
                     prompt_tokens=output.prompt_tokens,
                     completion_tokens=output.completion_tokens,
                     elapsed_seconds=elapsed,
+                    temperature=request.temperature,
+                    top_p=request.top_p,
+                    top_k=getattr(request, "top_k", None),
+                    max_tokens=request.max_tokens,
+                    seed=request.seed,
                 ))
 
             # Adapter health: bump last_request_at for the loaded adapter.
@@ -3066,6 +3071,11 @@ async def stream_chat_completion(
                     prompt_tokens=last_output.prompt_tokens,
                     completion_tokens=last_output.completion_tokens,
                     elapsed_seconds=end_time - start_time,
+                    temperature=request.temperature,
+                    top_p=request.top_p,
+                    top_k=getattr(request, "top_k", None),
+                    max_tokens=request.max_tokens,
+                    seed=request.seed,
                 ))
 
             # Adapter health: bump last_request_at for the loaded adapter.

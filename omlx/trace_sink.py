@@ -117,9 +117,19 @@ def build_chat_trace_record(
     prompt_tokens: int,
     completion_tokens: int,
     elapsed_seconds: float,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    max_tokens: int,
+    seed: Optional[int],
 ) -> dict[str, Any]:
     """Build a chat-completion trace record. Centralizes shape so both the
-    streaming and non-streaming paths produce identical records."""
+    streaming and non-streaming paths produce identical records.
+
+    Sampling params are wire-level (as received on the request body, after
+    any server-side defaulting in pydantic). They reflect what the client
+    sent, not the post-resolution effective values applied during sampling.
+    """
     from ._version import __version__
 
     timestamp = datetime.now(tz=timezone.utc).isoformat(timespec="milliseconds")
@@ -135,4 +145,9 @@ def build_chat_trace_record(
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "elapsed_seconds": round(elapsed_seconds, 3),
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
+        "max_tokens": max_tokens,
+        "seed": seed,
     }

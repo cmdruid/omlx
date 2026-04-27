@@ -168,3 +168,49 @@ def test_chat_completion_emits_trace_record(tmp_path: Path, monkeypatch):
     assert record["completion_tokens"] == 5
     assert "elapsed_seconds" in record
     assert "timestamp" in record
+
+
+def test_build_chat_trace_record_includes_sampling_params():
+    """Sampling params from request body land in the trace record."""
+    from omlx.trace_sink import build_chat_trace_record
+
+    rec = build_chat_trace_record(
+        request_id="chatcmpl-xyz",
+        model_id="gpt-oss-20b-MXFP4-Q8",
+        adapter_id=None,
+        prompt_tokens=10,
+        completion_tokens=5,
+        elapsed_seconds=0.5,
+        temperature=0.7,
+        top_p=0.95,
+        top_k=0,
+        max_tokens=2048,
+        seed=42,
+    )
+
+    assert rec["temperature"] == 0.7
+    assert rec["top_p"] == 0.95
+    assert rec["top_k"] == 0
+    assert rec["max_tokens"] == 2048
+    assert rec["seed"] == 42
+
+
+def test_build_chat_trace_record_omits_seed_when_unset():
+    """seed is None on the wire when the client doesn't pass it; record must reflect that."""
+    from omlx.trace_sink import build_chat_trace_record
+
+    rec = build_chat_trace_record(
+        request_id="chatcmpl-xyz",
+        model_id="m",
+        adapter_id=None,
+        prompt_tokens=1,
+        completion_tokens=1,
+        elapsed_seconds=0.1,
+        temperature=1.0,
+        top_p=0.95,
+        top_k=0,
+        max_tokens=32768,
+        seed=None,
+    )
+    assert rec["seed"] is None
+    assert rec["temperature"] == 1.0
