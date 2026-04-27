@@ -205,3 +205,9 @@ def shutdown_adapter_health_cache() -> None:
     if _cache is not None:
         _cache.flush()
         _cache = None
+
+
+def ensure_health_for_adapter(adapter_dir: Path, *, adapter_id: str) -> AdapterHealth:
+    """Convenience wrapper: ensure a .health.json exists with adapter_id and
+    installed_at populated. Returns the resulting AdapterHealth."""
+    return get_adapter_health_cache().get_or_create(adapter_dir, adapter_id=adapter_id)

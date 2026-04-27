@@ -138,3 +138,51 @@ def test_cache_flush_persists_dirty_entries(tmp_path: Path):
     # Re-read sidecar from disk and verify load_count is persisted.
     on_disk = load_health(adapter_dir)
     assert on_disk.load_count == 1
+
+
+def test_health_fields_appear_in_get_status(tmp_path: Path):
+    """engine_pool._health_fields_for surfaces fields populated via the cache.
+
+    Direct-tests the helper used by engine_pool.get_status. Covers the
+    rescan→load→request progression by simulating each event manually.
+    """
+    from omlx.adapter_health import (
+        ensure_health_for_adapter,
+        get_adapter_health_cache,
+        shutdown_adapter_health_cache,
+    )
+    from omlx.engine_pool import _health_fields_for
+
+    adapter_dir = tmp_path / "rnd-008"
+    adapter_dir.mkdir()
+    try:
+        cache = get_adapter_health_cache()
+        ensure_health_for_adapter(adapter_dir, adapter_id="rnd-008")
+        cache.record_load_success(adapter_dir)
+        cache.record_request_seen(adapter_dir)
+
+        fields = _health_fields_for(str(adapter_dir))
+        assert fields["installed_at"]
+        assert fields["last_loaded_at"]
+        assert fields["last_request_at"]
+        assert fields["load_count"] == 1
+        assert fields["compatible"] is None  # not validated yet
+        assert fields["last_validated_at"] is None
+        assert fields["last_load_error"] is None
+    finally:
+        shutdown_adapter_health_cache()
+
+
+def test_health_fields_for_returns_empty_when_no_sidecar(tmp_path: Path):
+    """_health_fields_for returns {} when no sidecar exists for the path."""
+    from omlx.adapter_health import shutdown_adapter_health_cache
+    from omlx.engine_pool import _health_fields_for
+
+    try:
+        shutdown_adapter_health_cache()  # ensure clean cache
+        adapter_dir = tmp_path / "ghost"
+        adapter_dir.mkdir()
+        fields = _health_fields_for(str(adapter_dir))
+        assert fields == {}
+    finally:
+        shutdown_adapter_health_cache()

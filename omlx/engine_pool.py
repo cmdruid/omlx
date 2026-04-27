@@ -85,6 +85,26 @@ def _loaded_adapter_id(entry: "EngineEntry") -> Optional[str]:
     return Path(adapter_path).name
 
 
+def _health_fields_for(adapter_path: str) -> dict:
+    """Read AdapterHealth from the cache and return its serializable fields.
+
+    Returns {} if no sidecar / cache miss — caller's existing keys are unaffected.
+    """
+    from .adapter_health import get_adapter_health_cache
+    h = get_adapter_health_cache().get(Path(adapter_path))
+    if h is None:
+        return {}
+    return {
+        "installed_at": h.installed_at,
+        "last_loaded_at": h.last_loaded_at,
+        "last_request_at": h.last_request_at,
+        "load_count": h.load_count,
+        "compatible": h.compatible,
+        "last_validated_at": h.last_validated_at,
+        "last_load_error": h.last_load_error,
+    }
+
+
 def _build_engine_kwargs_with_adapter(
     entry: EngineEntry,
     settings,
@@ -918,6 +938,22 @@ class EnginePool:
             entry.last_access = time.time()
             self._current_model_memory += entry.estimated_size
 
+            # Record adapter-load success in the health sidecar (if attached).
+            _adapter_path = getattr(engine, "_adapter_path", None)
+            if _adapter_path:
+                from .adapter_health import get_adapter_health_cache
+                try:
+                    _health_cache = get_adapter_health_cache()
+                    _adapter_id_from_path = Path(_adapter_path).name
+                    # Defensive: ensure the entry exists in the cache.
+                    _health_cache.get_or_create(Path(_adapter_path), adapter_id=_adapter_id_from_path)
+                    _health_cache.record_load_success(Path(_adapter_path))
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.warning(
+                        "Failed to record adapter load_success for %s: %s",
+                        _adapter_path, exc,
+                    )
+
             # Propagate memory limit to new engine's scheduler
             if self._process_memory_enforcer is not None:
                 self._process_memory_enforcer._propagate_memory_limit()
@@ -1006,6 +1042,7 @@ class EnginePool:
                             "rank": a.rank,
                             "num_layers": a.num_layers,
                             "fine_tune_type": a.fine_tune_type,
+                            **_health_fields_for(a.path),
                         }
                         for a in e.available_adapters
                     ],
@@ -1049,6 +1086,17 @@ class EnginePool:
                 # which EngineEntry provides — structurally compatible with
                 # the DiscoveredModel type annotation in discover_adapters.
                 discover_adapters(adapter_root, self._entries)  # type: ignore[arg-type]
+
+            # Ensure each discovered adapter has a .health.json sidecar.
+            from .adapter_health import ensure_health_for_adapter
+            for entry in self._entries.values():
+                for ai in entry.available_adapters:
+                    try:
+                        ensure_health_for_adapter(Path(ai.path), adapter_id=ai.adapter_id)
+                    except Exception as exc:  # pylint: disable=broad-except
+                        logger.warning(
+                            "Failed to ensure health sidecar for %s: %s", ai.path, exc,
+                        )
 
             # Compute diff counts.
             after: dict[str, set[str]] = {

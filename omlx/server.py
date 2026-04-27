@@ -45,6 +45,7 @@ import logging
 import os
 import time
 import uuid
+from pathlib import Path
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -404,6 +405,9 @@ async def lifespan(app: FastAPI):
     if _server_state.engine_pool is not None:
         await _server_state.engine_pool.shutdown()
         logger.info("Engine pool shutdown")
+    # Flush adapter-health cache before exit.
+    from .adapter_health import shutdown_adapter_health_cache
+    shutdown_adapter_health_cache()
     # Close trace sink last so any in-flight teardown logging is captured.
     shutdown_trace_sink()
 
@@ -2210,12 +2214,14 @@ async def create_chat_completion(
             generation_duration=elapsed,
             model_id=resolved_model,
         )
-        # Emit per-request trace record (best-effort).
+        # Emit per-request trace record and bump adapter health (best-effort).
         try:
+            _entry = get_engine_pool().get_entry(resolved_model)
+            _adapter_id = _loaded_adapter_id(_entry) if _entry is not None else None
+
+            # Trace record
             _sink = get_trace_sink()
             if _sink is not None:
-                _entry = get_engine_pool().get_entry(resolved_model)
-                _adapter_id = _loaded_adapter_id(_entry) if _entry is not None else None
                 _sink.write(build_chat_trace_record(
                     request_id=response_id,
                     model_id=resolved_model,
@@ -2224,8 +2230,16 @@ async def create_chat_completion(
                     completion_tokens=output.completion_tokens,
                     elapsed_seconds=elapsed,
                 ))
+
+            # Adapter health: bump last_request_at for the loaded adapter.
+            if _adapter_id and _entry is not None:
+                from .adapter_health import get_adapter_health_cache
+                for _ai in _entry.available_adapters:
+                    if _ai.adapter_id == _adapter_id:
+                        get_adapter_health_cache().record_request_seen(Path(_ai.path))
+                        break
         except Exception:  # noqa: BLE001
-            logger.warning("trace emit failed", exc_info=True)
+            logger.warning("post-request hooks failed", exc_info=True)
 
         # Separate thinking from content
         raw_text = clean_special_tokens(output.text) if output.text else ""
@@ -2951,13 +2965,15 @@ async def stream_chat_completion(
             generation_duration=gen_duration,
             model_id=resolved_model or request.model,
         )
-        # Emit per-request trace record (best-effort).
+        # Emit per-request trace record and bump adapter health (best-effort).
         try:
+            _resolved = resolved_model or request.model
+            _entry = get_engine_pool().get_entry(_resolved)
+            _adapter_id = _loaded_adapter_id(_entry) if _entry is not None else None
+
+            # Trace record
             _sink = get_trace_sink()
             if _sink is not None:
-                _resolved = resolved_model or request.model
-                _entry = get_engine_pool().get_entry(_resolved)
-                _adapter_id = _loaded_adapter_id(_entry) if _entry is not None else None
                 _sink.write(build_chat_trace_record(
                     request_id=response_id,
                     model_id=_resolved,
@@ -2966,8 +2982,16 @@ async def stream_chat_completion(
                     completion_tokens=last_output.completion_tokens,
                     elapsed_seconds=end_time - start_time,
                 ))
+
+            # Adapter health: bump last_request_at for the loaded adapter.
+            if _adapter_id and _entry is not None:
+                from .adapter_health import get_adapter_health_cache
+                for _ai in _entry.available_adapters:
+                    if _ai.adapter_id == _adapter_id:
+                        get_adapter_health_cache().record_request_seen(Path(_ai.path))
+                        break
         except Exception:  # noqa: BLE001
-            logger.warning("trace emit failed", exc_info=True)
+            logger.warning("post-request hooks failed", exc_info=True)
 
         # Emit usage chunk if requested
         if request.stream_options and request.stream_options.include_usage:
