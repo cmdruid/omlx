@@ -202,8 +202,12 @@ def verify_session(request: Request) -> bool:
 async def require_admin(request: Request) -> bool:
     """FastAPI dependency to require admin authentication.
 
-    This dependency can be used in route definitions to protect
-    admin-only endpoints. It checks for a valid session cookie.
+    Accepts either:
+    - A valid session cookie (browser dashboard path), OR
+    - An ``Authorization: Bearer <api_key>`` header that matches the configured
+      server api_key or any of its sub-keys (script path).
+
+    Bearer is checked first because it short-circuits cleanly when present.
 
     Args:
         request: The FastAPI request object (injected by FastAPI).
@@ -226,6 +230,24 @@ async def require_admin(request: Request) -> bool:
         if gs is not None and gs.auth.skip_api_key_verification:
             return True
 
+    # Bearer token path — short-circuits; invalid bearer → immediate 401
+    authz = request.headers.get("authorization") or ""
+    if authz.lower().startswith("bearer "):
+        token = authz.split(None, 1)[1].strip()
+        from ..server import _server_state  # deferred to avoid circular import at module load
+        api_key = _server_state.api_key
+        sub_keys = []
+        if _server_state.global_settings is not None:
+            sub_keys = list(getattr(_server_state.global_settings.auth, "sub_keys", []) or [])
+        if api_key and verify_any_api_key(token, api_key, sub_keys):
+            return True
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid bearer token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # Cookie path (existing behavior)
     if not verify_session(request):
         # Browser requests (Accept: text/html) get redirected to login page
         accept = request.headers.get("accept", "")
