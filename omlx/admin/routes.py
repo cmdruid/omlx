@@ -1503,15 +1503,25 @@ async def reload_models(is_admin: bool = Depends(require_admin)):
 
 
 @router.post("/api/adapters/rescan")
-async def rescan_adapters_route(is_admin: bool = Depends(require_admin)):
+async def rescan_adapters_route(
+    validate: bool = False,
+    is_admin: bool = Depends(require_admin),
+):
     """Re-walk ~/.omlx/adapters/ and refresh each base's available_adapters.
+
+    Pass ``?validate=true`` to additionally exercise each adapter with a
+    1-token forward pass. Results are persisted to each adapter's
+    .health.json sidecar (compatible, last_validated_at, last_load_error).
+
+    Latency: validate=true adds ~5-10 seconds per adapter (Metal load cycle).
+    Use sparingly; default is validate=false.
 
     Returns a summary dict with attached/removed/total counts.
     """
     pool = _get_engine_pool()
     if pool is None:
         raise HTTPException(status_code=503, detail="engine pool unavailable")
-    return await pool.rescan_adapters()
+    return await pool.rescan_adapters(validate=validate)
 
 
 class LoadAdapterRequest(BaseModel):
@@ -1548,6 +1558,30 @@ async def load_adapter_route(
     entry = pool.get_entry(model_id)
     if entry is None:
         raise HTTPException(status_code=404, detail=f"Model not found: {model_id}")
+
+    # Hard-block: reject adapters previously validated as incompatible.
+    # Mirrors the same check in the B9 per-request override path.
+    if request.adapter_id is not None:
+        from ..adapter_health import get_adapter_health_cache
+        for a in entry.available_adapters:
+            if a.adapter_id == request.adapter_id:
+                h = get_adapter_health_cache().get(Path(a.path))
+                if h is not None and h.compatible is False:
+                    return JSONResponse(
+                        status_code=400,
+                        content={
+                            "success": False,
+                            "model_id": model_id,
+                            "error": {
+                                "type": "adapter_incompatible",
+                                "message": (
+                                    h.last_load_error
+                                    or "adapter validation reported incompatible"
+                                ),
+                            },
+                        },
+                    )
+                break
 
     # Snapshot the previous adapter_id so we can revert on load failure.
     prev_settings = settings_manager.get_settings(model_id)

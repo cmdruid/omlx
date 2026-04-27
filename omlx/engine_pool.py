@@ -1167,12 +1167,72 @@ class EnginePool:
             ],
         }
 
-    async def rescan_adapters(self) -> dict:
+    async def _validate_adapter(
+        self, model_id: str, adapter_info: "AdapterInfo"  # type: ignore[name-defined]
+    ) -> "tuple[bool, Optional[str]]":
+        """Verify the adapter loads cleanly against its base model.
+
+        Returns ``(compatible, last_load_error)``: ``(True, None)`` on success,
+        ``(False, <error message>)`` on failure.
+
+        Calls ``swap_adapter_for_request`` to attempt the load. After validation
+        (success or failure), restores the adapter that was loaded before the
+        validation attempt. Settings.adapter_id is never mutated by this method
+        (validation is a read-only inspection from the user's perspective).
+
+        The caller MUST NOT hold ``entry.swap_lock`` — this method acquires it.
+        """
+        entry = self._entries.get(model_id)
+        if entry is None:
+            return False, f"model not found: {model_id}"
+
+        async with entry.swap_lock:
+            # Snapshot what was loaded before validation so we can restore it.
+            # Taken inside the lock so a concurrent override can't change the
+            # engine state between snapshot and the validation swap.
+            current_adapter_id = (
+                _loaded_adapter_id(entry) if entry.engine is not None else None
+            )
+
+            try:
+                await self.swap_adapter_for_request(model_id, adapter_info.adapter_id)
+            except AdapterSwapError as exc:
+                # Restore best-effort to whatever was loaded before validation.
+                try:
+                    await self.swap_adapter_for_request(model_id, current_adapter_id)
+                except Exception:  # noqa: BLE001
+                    pass
+                return False, exc.message
+            except Exception as exc:  # noqa: BLE001
+                # Defensive — unexpected failures are treated as incompatible.
+                try:
+                    await self.swap_adapter_for_request(model_id, current_adapter_id)
+                except Exception:  # noqa: BLE001
+                    pass
+                return False, str(exc)
+
+            # Validation succeeded — restore to what was loaded before.
+            try:
+                await self.swap_adapter_for_request(model_id, current_adapter_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Validation succeeded for %s but restore-swap failed: %s",
+                    adapter_info.adapter_id,
+                    exc,
+                )
+
+        return True, None
+
+    async def rescan_adapters(self, *, validate: bool = False) -> dict:
         """Re-walk ~/.omlx/adapters/ and refresh each base's available_adapters.
 
         Picks up adapters added/removed since server startup. Holds the pool lock
         for the duration to serialize against loads/unloads — rescan is O(adapter-count)
         filesystem reads, so the pause is brief.
+
+        Pass ``validate=True`` to additionally exercise each adapter with a load
+        cycle via ``_validate_adapter``. Results are persisted to each adapter's
+        ``.health.json`` sidecar via ``AdapterHealthCache.record_validation``.
 
         v1 constraint: always scans Path.home() / ".omlx" / "adapters". Multi-root
         support (deriving adapter dirs from configured model_dirs) can be added later
@@ -1223,10 +1283,21 @@ class EnginePool:
             total = sum(len(s) for s in after.values())
 
             logger.info(
-                f"Adapter rescan complete: {attached} attached, {removed} removed, "
-                f"{total} total across {len(self._entries)} models"
+                "Adapter rescan complete: %d attached, %d removed, %d total across %d models",
+                attached, removed, total, len(self._entries),
             )
-            return {"attached": attached, "removed": removed, "total": total}
+
+        # Validation is done outside the pool lock — each adapter load acquires
+        # entry.swap_lock independently, which is sufficient for atomicity.
+        if validate:
+            from .adapter_health import get_adapter_health_cache
+            cache = get_adapter_health_cache()
+            for entry_id, entry in list(self._entries.items()):
+                for ai in entry.available_adapters:
+                    ok, err = await self._validate_adapter(entry_id, ai)
+                    cache.record_validation(Path(ai.path), compatible=ok, error=err)
+
+        return {"attached": attached, "removed": removed, "total": total}
 
     async def check_ttl_expirations(
         self,
