@@ -1296,6 +1296,10 @@ class EnginePool:
                 for ai in entry.available_adapters:
                     ok, err = await self._validate_adapter(entry_id, ai)
                     cache.record_validation(Path(ai.path), compatible=ok, error=err)
+            # Surface results to disk immediately so callers reading the
+            # sidecar right after rescan see the validation outcome (the
+            # 300s periodic flush is too slow for deploy-gate consumers).
+            cache.flush()
 
         return {"attached": attached, "removed": removed, "total": total}
 

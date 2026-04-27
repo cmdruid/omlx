@@ -124,15 +124,128 @@ async def test_rescan_with_validate_true_records_validation(monkeypatch, tmp_pat
     try:
         result = await pool.rescan_adapters(validate=True)
 
-        # Flush the cache so all dirty entries land on disk.
-        cache = get_adapter_health_cache()
-        cache.flush()
-
-        # The sidecar should exist and report compatible=True.
+        # No manual cache.flush() — rescan_adapters flushes itself when
+        # validate=True so consumers reading the sidecar immediately see the
+        # outcome.
         sidecar = adapter_dir / ".health.json"
         assert sidecar.exists(), f"sidecar missing at {sidecar}"
         data = json.loads(sidecar.read_text())
         assert data["compatible"] is True
+    finally:
+        shutdown_adapter_health_cache()
+
+
+@pytest.mark.asyncio
+async def test_rescan_with_validate_true_records_failure(monkeypatch, tmp_path):
+    """rescan_adapters(validate=True) writes compatible=False + last_load_error
+    when _validate_adapter reports failure. End-to-end: cache → disk via the
+    rescan-side flush."""
+    from omlx.engine_pool import EnginePool
+
+    pool = EnginePool.__new__(EnginePool)
+    pool._lock = asyncio.Lock()
+
+    adapter_dir = tmp_path / "rnd-broken"
+    adapter_dir.mkdir()
+    adapter = MagicMock()
+    adapter.adapter_id = "rnd-broken"
+    adapter.path = str(adapter_dir)
+
+    entry = MagicMock()
+    entry.engine = None
+    entry.available_adapters = [adapter]
+    entry.swap_lock = asyncio.Lock()
+
+    pool._entries = {"test-model": entry}
+    pool._settings_manager = None
+
+    # Stub _validate_adapter to report incompatible.
+    pool._validate_adapter = AsyncMock(return_value=(False, "shape mismatch in self_attn.q_proj"))
+
+    def _stub_discover(root, entries):
+        for e in entries.values():
+            e.available_adapters.append(adapter)
+
+    monkeypatch.setattr("omlx.model_discovery.discover_adapters", _stub_discover)
+
+    omlx_adapters = tmp_path / ".omlx" / "adapters"
+    omlx_adapters.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+
+    try:
+        await pool.rescan_adapters(validate=True)
+
+        sidecar = adapter_dir / ".health.json"
+        assert sidecar.exists(), f"sidecar missing at {sidecar}"
+        data = json.loads(sidecar.read_text())
+        assert data["compatible"] is False
+        assert data["last_load_error"] == "shape mismatch in self_attn.q_proj"
+        assert data["last_validated_at"] is not None
+    finally:
+        shutdown_adapter_health_cache()
+
+
+@pytest.mark.asyncio
+async def test_rescan_without_validate_does_not_change_compatibility(monkeypatch, tmp_path):
+    """rescan_adapters(validate=False) (default) leaves compatible field
+    untouched — does NOT trigger _validate_adapter or write compatibility."""
+    from omlx.adapter_health import save_health, AdapterHealth, load_health
+    from omlx.engine_pool import EnginePool
+
+    pool = EnginePool.__new__(EnginePool)
+    pool._lock = asyncio.Lock()
+
+    adapter_dir = tmp_path / "rnd-005"
+    adapter_dir.mkdir()
+    adapter = MagicMock()
+    adapter.adapter_id = "rnd-005"
+    adapter.path = str(adapter_dir)
+
+    # Pre-seed the sidecar with compatible=True so we can detect any unwanted change.
+    pre = AdapterHealth(
+        adapter_id="rnd-005",
+        installed_at="2026-04-26T10:00:00.000Z",
+        last_loaded_at=None,
+        last_request_at=None,
+        load_count=0,
+        compatible=True,
+        last_validated_at="2026-04-26T10:00:00.000Z",
+        last_load_error=None,
+    )
+    save_health(adapter_dir, pre)
+
+    entry = MagicMock()
+    entry.engine = None
+    entry.available_adapters = [adapter]
+    entry.swap_lock = asyncio.Lock()
+
+    pool._entries = {"test-model": entry}
+    pool._settings_manager = None
+
+    # _validate_adapter must NOT be called on the validate=False path.
+    pool._validate_adapter = AsyncMock()
+
+    def _stub_discover(root, entries):
+        for e in entries.values():
+            e.available_adapters.append(adapter)
+
+    monkeypatch.setattr("omlx.model_discovery.discover_adapters", _stub_discover)
+
+    omlx_adapters = tmp_path / ".omlx" / "adapters"
+    omlx_adapters.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+
+    try:
+        await pool.rescan_adapters()  # default validate=False
+
+        # _validate_adapter must not have been awaited.
+        pool._validate_adapter.assert_not_awaited()
+
+        # Sidecar's compatible field must still be True (untouched).
+        on_disk = load_health(adapter_dir)
+        assert on_disk is not None
+        assert on_disk.compatible is True
+        assert on_disk.last_load_error is None
     finally:
         shutdown_adapter_health_cache()
 
