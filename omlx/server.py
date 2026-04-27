@@ -2154,11 +2154,50 @@ async def create_chat_completion(
             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
         )
 
+    # For gpt-oss non-streaming: run inference eagerly so we can validate
+    # tool-call arguments and return a structured 502 BEFORE committing
+    # response headers (StreamingResponse commits headers on first yield).
+    _eager_output: list = [None]   # list-cell so the closure captures by ref
+    _eager_start: list = [None]
+
+    if engine.model_type == "gpt_oss" and not request.stream:
+        _eager_start[0] = time.perf_counter()
+        _eager_output[0] = await engine.chat(messages=messages, **chat_kwargs)
+        if _eager_output[0].tool_calls:
+            for _tc in _eager_output[0].tool_calls:
+                _raw_args = _tc.get("arguments", "")
+                try:
+                    json.loads(_raw_args)
+                except (json.JSONDecodeError, TypeError) as _exc:
+                    logger.warning(
+                        "gpt-oss tool-call has unparseable JSON arguments "
+                        "(tool=%s): %s", _tc.get("name"), _exc
+                    )
+                    return JSONResponse(
+                        status_code=502,
+                        content={
+                            "error": {
+                                "type": "tool_call_validation_error",
+                                "message": "Tool call arguments could not be parsed as JSON",
+                                "details": {
+                                    "tool_name": _tc.get("name"),
+                                    "raw_arguments": str(_raw_args)[:500],
+                                    "parse_error": str(_exc),
+                                },
+                            }
+                        },
+                    )
+
     # Non-streaming response with keepalive during prefill
     async def _build_chat_completion():
-        start_time = time.perf_counter()
-
-        output = await engine.chat(messages=messages, **chat_kwargs)
+        # Use eagerly-fetched output when available (gpt-oss path above),
+        # otherwise run inference inside the keepalive wrapper.
+        if _eager_output[0] is not None:
+            start_time = _eager_start[0]
+            output = _eager_output[0]
+        else:
+            start_time = time.perf_counter()
+            output = await engine.chat(messages=messages, **chat_kwargs)
 
         elapsed = time.perf_counter() - start_time
         tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
@@ -2767,19 +2806,43 @@ async def stream_chat_completion(
     tool_calls = None
     cleaned_text = accumulated_text
     if last_output and last_output.tool_calls:
-        # Harmony model — tool_calls already extracted by parser
+        # Harmony model — tool_calls already extracted by parser.
+        # Validate JSON arguments before building ToolCall objects; a
+        # malformed argument string would crash FunctionCall construction and
+        # abort the generator mid-stream with no useful signal to the client.
         from .api.openai_models import ToolCall, FunctionCall
-        tool_calls = [
-            ToolCall(
+        tool_calls = []
+        for tc in last_output.tool_calls:
+            raw_args = tc.get("arguments", "")
+            try:
+                json.loads(raw_args)
+            except (json.JSONDecodeError, TypeError) as exc:
+                logger.warning(
+                    "gpt-oss streaming tool-call has unparseable JSON arguments "
+                    "(tool=%s): %s", tc.get("name"), exc
+                )
+                error_data = {
+                    "error": {
+                        "type": "tool_call_validation_error",
+                        "message": "Tool call arguments could not be parsed as JSON",
+                        "details": {
+                            "tool_name": tc.get("name"),
+                            "raw_arguments": str(raw_args)[:500],
+                            "parse_error": str(exc),
+                        },
+                    }
+                }
+                yield f"data: {json.dumps(error_data)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+            tool_calls.append(ToolCall(
                 id=f"call_{uuid.uuid4().hex[:8]}",
                 type="function",
                 function=FunctionCall(
                     name=tc["name"],
-                    arguments=tc["arguments"],
+                    arguments=raw_args,
                 ),
-            )
-            for tc in last_output.tool_calls
-        ]
+            ))
         cleaned_text = ""
     elif has_tools and accumulated_text:
         # Separate thinking from content, then parse tool calls from content
