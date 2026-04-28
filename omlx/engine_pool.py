@@ -983,6 +983,39 @@ class EnginePool:
             entry.is_loading = False
             entry.abort_loading = False
 
+    def _record_adapter_load_failure(
+        self, adapter_id: Optional[str], entry: "EngineEntry", error_msg: str
+    ) -> None:
+        """Best-effort: stamp ``compatible: False`` + ``last_load_error`` on
+        the adapter's health sidecar after a failed load.
+
+        Lets the hard-block on subsequent selections fail-fast without
+        burning another Metal load cycle. Skipped when ``adapter_id`` is
+        None (no adapter to mark) or when the adapter isn't in
+        ``available_adapters`` (defensive — shouldn't reach here).
+
+        Failures during the cache write are swallowed — recording is
+        observability, not load correctness.
+        """
+        if not adapter_id:
+            return
+        for ai in entry.available_adapters:
+            if ai.adapter_id == adapter_id:
+                try:
+                    from .adapter_health import get_adapter_health_cache
+                    cache = get_adapter_health_cache()
+                    cache.get_or_create(Path(ai.path), adapter_id=adapter_id)
+                    cache.record_validation(
+                        Path(ai.path), compatible=False, error=error_msg,
+                    )
+                    cache.flush()
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "Failed to record load-failure on health sidecar for %s",
+                        adapter_id, exc_info=True,
+                    )
+                break
+
     async def swap_adapter(
         self, model_id: str, adapter_id: Optional[str]
     ) -> None:
@@ -1035,6 +1068,9 @@ class EnginePool:
             try:
                 await self._load_engine(model_id)
             except Exception as exc:  # noqa: BLE001
+                # Auto-record incompatibility so future selections fail-fast
+                # via the hard-block instead of repeating the failed load.
+                self._record_adapter_load_failure(adapter_id, entry, str(exc))
                 raise AdapterSwapError("adapter_load_failed", str(exc)) from exc
 
     async def swap_adapter_for_request(
@@ -1085,6 +1121,7 @@ class EnginePool:
                 await self._unload_engine(model_id)
             await self._load_engine(model_id)
         except Exception as exc:  # noqa: BLE001
+            self._record_adapter_load_failure(adapter_id, entry, str(exc))
             raise AdapterSwapError("adapter_load_failed", str(exc)) from exc
         finally:
             # Restore settings.adapter_id in memory — never persisted.

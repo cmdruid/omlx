@@ -120,3 +120,139 @@ async def test_swap_adapter_load_failure_wraps_in_adapter_swap_error():
 
     assert exc_info.value.error_type == "adapter_load_failed"
     assert "shape mismatch" in exc_info.value.message
+
+
+@pytest.mark.asyncio
+async def test_swap_adapter_records_compatibility_false_on_load_failure(tmp_path):
+    """A failed swap_adapter writes compatible=False to the health sidecar.
+
+    Closes the architectural gap (Option B): the hard-block on subsequent
+    selections fires automatically without requiring an explicit
+    ?validate=true rescan.
+    """
+    from omlx.adapter_health import (
+        get_adapter_health_cache,
+        load_health,
+        shutdown_adapter_health_cache,
+    )
+    from omlx.engine_pool import EnginePool
+
+    adapter_dir = tmp_path / "rnd-broken"
+    adapter_dir.mkdir()
+    adapter = MagicMock()
+    adapter.adapter_id = "rnd-broken"
+    adapter.path = str(adapter_dir)
+    entry = _make_entry(adapters=[adapter])
+    entry.engine = MagicMock()  # currently loaded → triggers unload before load
+
+    pool = EnginePool.__new__(EnginePool)
+    pool._entries = {"test-model": entry}
+
+    settings = MagicMock()
+    settings.adapter_id = None
+    sm = MagicMock()
+    sm.get_settings = MagicMock(return_value=settings)
+    sm.set_settings = MagicMock()
+    pool._settings_manager = sm
+
+    pool._unload_engine = AsyncMock()
+    pool._load_engine = AsyncMock(side_effect=RuntimeError("shape mismatch in self_attn.q_proj"))
+
+    try:
+        with pytest.raises(AdapterSwapError) as exc_info:
+            await pool.swap_adapter("test-model", "rnd-broken")
+        assert exc_info.value.error_type == "adapter_load_failed"
+
+        # Sidecar must reflect the failure on disk (record_adapter_load_failure
+        # flushes the cache so consumers see it immediately).
+        on_disk = load_health(adapter_dir)
+        assert on_disk is not None
+        assert on_disk.compatible is False
+        assert "shape mismatch" in on_disk.last_load_error
+        assert on_disk.last_validated_at is not None
+    finally:
+        shutdown_adapter_health_cache()
+
+
+@pytest.mark.asyncio
+async def test_swap_adapter_for_request_records_compatibility_false_on_load_failure(tmp_path):
+    """A failed swap_adapter_for_request writes compatible=False too.
+
+    Mirrors swap_adapter's behavior — the per-request override path also
+    benefits from auto-arming the hard-block.
+    """
+    from omlx.adapter_health import (
+        load_health,
+        shutdown_adapter_health_cache,
+    )
+    from omlx.engine_pool import EnginePool
+    from omlx.model_settings import ModelSettings
+
+    adapter_dir = tmp_path / "rnd-broken"
+    adapter_dir.mkdir()
+    adapter = MagicMock()
+    adapter.adapter_id = "rnd-broken"
+    adapter.path = str(adapter_dir)
+    entry = _make_entry(adapters=[adapter])
+    entry.engine = None
+
+    pool = EnginePool.__new__(EnginePool)
+    pool._entries = {"test-model": entry}
+
+    # ModelSettingsManager-shaped stub: has ._lock and ._settings dict.
+    import threading
+    sm = MagicMock()
+    sm._lock = threading.Lock()
+    sm._settings = {"test-model": ModelSettings()}
+    pool._settings_manager = sm
+
+    pool._unload_engine = AsyncMock()
+    pool._load_engine = AsyncMock(side_effect=RuntimeError("OOM during adapter load"))
+
+    try:
+        with pytest.raises(AdapterSwapError) as exc_info:
+            await pool.swap_adapter_for_request("test-model", "rnd-broken")
+        assert exc_info.value.error_type == "adapter_load_failed"
+
+        on_disk = load_health(adapter_dir)
+        assert on_disk is not None
+        assert on_disk.compatible is False
+        assert "OOM during adapter load" in on_disk.last_load_error
+    finally:
+        shutdown_adapter_health_cache()
+
+
+@pytest.mark.asyncio
+async def test_swap_adapter_does_not_record_when_detaching_to_base(tmp_path):
+    """adapter_id=None (detach) failures do NOT write to the sidecar.
+
+    Detaching is a base-model load — there's no adapter to mark
+    incompatible. We can't infer "incompatible" from a failure here.
+    """
+    from omlx.adapter_health import shutdown_adapter_health_cache
+    from omlx.engine_pool import EnginePool
+
+    entry = _make_entry()
+    entry.engine = MagicMock()
+
+    pool = EnginePool.__new__(EnginePool)
+    pool._entries = {"test-model": entry}
+
+    settings = MagicMock()
+    settings.adapter_id = "rnd-001"
+    sm = MagicMock()
+    sm.get_settings = MagicMock(return_value=settings)
+    sm.set_settings = MagicMock()
+    pool._settings_manager = sm
+
+    pool._unload_engine = AsyncMock()
+    pool._load_engine = AsyncMock(side_effect=RuntimeError("base model OOM"))
+
+    try:
+        with pytest.raises(AdapterSwapError):
+            await pool.swap_adapter("test-model", None)
+        # No sidecar should have been touched (no adapter_id to mark).
+        # The tmp_path itself is a directory; check no .health.json files exist.
+        assert list(tmp_path.glob("**/.health.json")) == []
+    finally:
+        shutdown_adapter_health_cache()
